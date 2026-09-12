@@ -1,4 +1,4 @@
-# doh-server
+# DNS Server
 
 A high-performance, lightweight, multi-protocol recursive DNS server built in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) simultaneously while performing independent, from-root recursive resolution without relying on upstream resolvers like Cloudflare or Google.
 
