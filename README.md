@@ -1,148 +1,224 @@
-# What actually changed
+# doh-server
 
-Diagnosis, in order of impact:
-
-1. **DoH was plaintext HTTP.** DoH (RFC 8484) requires HTTPS — any real
-   client (browser, Android) just refuses to use a non-TLS endpoint.
-   Fixed: DoH is now served over real TLS via `axum-server` on port 443.
-
-2. **DoT self-signed a cert for `localhost`.** Android's Private DNS
-   (hostname mode) checks the cert against a public CA for the exact
-   hostname you type in Settings. A self-signed cert can never pass —
-   Android just silently falls back to plaintext DNS, which is why it
-   *looked* like DoT "wasn't working" rather than throwing an error.
-   **This is not fixable in code.** You need a real certificate for a
-   real domain name you control. See setup below — it's free and takes
-   about 2 minutes with certbot.
-
-3. **No delegation caching.** The old recursive resolver walked from
-   the 13 root servers on every single query, with zero memory of
-   "here's who handles `.com`" or "here's who handles `example.com`".
-   Fixed: every delegation learned is cached by zone with its own TTL,
-   and new queries start from the deepest cached zone instead of the
-   root.
-
-4. **No NODATA caching.** A NOERROR-with-zero-answers response (e.g. an
-   AAAA query against an IPv4-only host — this happens on nearly every
-   single web request, since most OSes query A and AAAA in parallel)
-   was never cached, so it re-walked from the root every time. Fixed:
-   NODATA is now cached the same as any other answer.
-
-5. **Sequential nameserver queries.** One slow/dead nameserver added a
-   full timeout of latency per hop. Fixed: up to 4 nameservers are
-   raced in parallel per hop.
-
-6. **Only IPv4 glue was read**, so referrals carrying only `AAAA` glue
-   failed outright. Fixed: both are collected now.
-
-7. **No loop guard beyond a step counter** — a misconfigured zone could
-   burn the whole step budget doing nothing. Fixed: a referral that
-   doesn't advance to a new zone aborts immediately.
-
-8. **Cache pre-warming (10k domains, concurrency 32) fired at process
-   start**, competing with live queries for sockets right when the
-   server was least ready for it. Fixed: off by default, and when
-   enabled, waits 60s after startup and defaults to concurrency 6.
-
-None of this changes the fact that it's still a fully independent,
-from-root recursive resolver — no Cloudflare, no upstream dependency.
+A high-performance, lightweight, multi-protocol recursive DNS server built in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) simultaneously while performing independent, from-root recursive resolution without relying on upstream resolvers like Cloudflare or Google.
 
 ---
 
-# Setup
+## Features & Architecture
 
-## 1. You need a domain name
+* **Multi-Protocol Support**: Handles UDP/TCP DNS (port 53), DoT (port 853), and DoH (port 443 / 3053) concurrently in a single binary.
+* **From-Root Recursive Resolver**: Performs full root-zone iterations independently with no external upstream dependencies.
+* **Smart Delegation & Zone Caching**: Learns zone delegations with their respective TTLs and starts subsequent queries from the deepest known cached zone rather than restarting from root servers.
+* **NODATA & NXDOMAIN Caching**: Caches empty `NOERROR` responses (such as `AAAA` lookups on IPv4-only domains) and non-existent domains to prevent unnecessary query loops.
+* **Parallel Nameserver Racing**: Races up to 4 nameservers concurrently per hop to eliminate latency spikes caused by slow or unresponsive nameservers.
+* **Dual IPv4/IPv6 Glue Processing**: Collects both `A` and `AAAA` glue records during referrals.
+* **Loop Guard Protection**: Immediately aborts query walks if a referral fails to advance to a deeper zone.
+* **Configurable Cache Pre-Warming**: Optional background cache warming for top domains, deferred by 60 seconds at boot with controlled concurrency to prevent socket exhaustion.
 
-There's no way around this for DoT/DoH to work with real clients. Point
-an `A` (and `AAAA` if you have IPv6) record at your server's IP, e.g.
-`dns.yourdomain.com -> your.server.ip`.
+---
 
-## 2. Get a real certificate (free, ~2 minutes)
+## Prerequisites
 
-The server doesn't use port 80 for anything, so certbot's standalone
-mode is the simplest option:
+1. **Domain Name**: A public domain or subdomain (e.g., `dns.example.com`) pointing to your server's IP address. Real clients (Android Private DNS, iOS, Browsers) strictly require valid TLS certificates matching the FQDN.
+2. **TLS Certificate**: A valid certificate from Let's Encrypt or ZeroSSL.
+3. **Capabilities / Root Permissions**: Binding to low ports (53, 443, 853) requires `root` execution or capability grants via `setcap`.
 
-```bash
-sudo apt install certbot
-sudo certbot certonly --standalone -d dns.yourdomain.com
-```
+---
 
-That writes:
-- `/etc/letsencrypt/live/dns.yourdomain.com/fullchain.pem`
-- `/etc/letsencrypt/live/dns.yourdomain.com/privkey.pem`
+## Build & Installation
 
-Point the server at them:
-
-```bash
-export CERT_PATH=/etc/letsencrypt/live/dns.yourdomain.com/fullchain.pem
-export KEY_PATH=/etc/letsencrypt/live/dns.yourdomain.com/privkey.pem
-```
-
-Certbot auto-renews via its systemd timer, but the running process
-needs to reload the new cert — simplest is a renewal hook that restarts
-the service:
-
-```bash
-sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-dns.sh <<'EOF'
-#!/bin/sh
-systemctl restart doh-server
-EOF
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-dns.sh
-```
-
-If you skip this step entirely, the server still starts — it just
-generates a self-signed cert and logs a loud warning. That's fine for
-poking at it locally with `curl -k` or `kdig`, but Android/browsers
-will not use it.
-
-## 3. Ports 53 / 443 / 853 need root, or a capability grant
-
-Either run it as root, or grant the binary the capability instead:
-
-```bash
-sudo setcap 'cap_net_bind_service=+ep' /path/to/doh-server
-```
-
-## 4. Build and run
+### 1. Compile the Binary
 
 ```bash
 cargo build --release
-./target/release/doh-server
 ```
 
-Env vars (all optional):
+The compiled binary will be located at `./target/release/doh-server`.
 
-| Var | Default | Meaning |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Bind address |
-| `DNS_PORT` | `53` | Plain UDP/TCP DNS |
-| `DOT_PORT` | `853` | DNS-over-TLS |
-| `DOH_PORT` | `443` | DNS-over-HTTPS |
-| `CERT_PATH` / `KEY_PATH` | `fullchain.pem` / `privkey.pem` | TLS cert |
-| `WARM_LIMIT` | `0` (off) | Pre-warm cache with top N domains on startup |
-| `WARM_CONCURRENCY` | `6` | Parallelism for pre-warming |
+### 2. Grant Network Binding Capabilities (Optional)
 
-## 5. Point clients at it
-
-- **Android**: Settings → Network → Private DNS → Private DNS provider
-  hostname → `dns.yourdomain.com`
-- **DoH (Firefox, most browsers)**: `https://dns.yourdomain.com/dns-query`
-- **Plain DNS**: just set it as your router/device's DNS server IP.
-
-## Quick local test (before pointing real devices at it)
+If running the daemon under an unprivileged system user:
 
 ```bash
-# plain DNS
-dig @127.0.0.1 example.com
-
-# DoT (expect a valid cert chain once you have a real one)
-kdig -d @dns.yourdomain.com +tls example.com
-
-# DoH
-curl -k -H 'accept: application/dns-json' \
-  'https://dns.yourdomain.com/dns-query?dns=<base64url-encoded-query>'
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
 ```
 
-If `kdig`/`curl` fail with a certificate error, that's expected until
-step 2 is done with a real domain — it confirms the self-signed
-fallback is in fact the only thing standing between you and it working.
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST` | `0.0.0.0` | IP address to bind network listeners |
+| `DNS_PORT` | `53` | Plain UDP/TCP DNS port |
+| `DOT_PORT` | `853` | DNS-over-TLS (DoT) port |
+| `DOH_PORT` | `443` (or `3053` behind proxy) | DNS-over-HTTPS (DoH) port |
+| `CERT_PATH` | `fullchain.pem` | Path to TLS certificate (`.crt` or `.pem`) |
+| `KEY_PATH` | `privkey.pem` | Path to TLS private key (`.key`) |
+| `CACHE_FILE` | None | File path for persistent disk cache storage |
+| `WARM_LIMIT` | `0` (off) | Pre-warm cache with top N domains on boot |
+| `WARM_CONCURRENCY` | `6` | Max concurrent worker threads for pre-warming |
+
+---
+
+## Deployment Setup
+
+### 1. Systemd Service
+
+Create `/etc/systemd/system/doh-server.service`:
+
+```ini
+[Unit]
+Description=Unified DNS Server (DoH + Port 53 UDP/TCP)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ryan/dns
+Environment=PORT=3053
+Environment=DOH_PORT=3053
+Environment=DOT_PORT=853
+Environment=DNS_PORT=53
+Environment=HOST=0.0.0.0
+Environment=CACHE_FILE=/home/ryan/dns/cache.json
+Environment=CERT_PATH=/etc/ssl/certs/dns.example.com.crt
+Environment=KEY_PATH=/etc/ssl/private/dns.example.com.key
+ExecStart=/home/ryan/dns/target/release/doh-server
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now doh-server.service
+```
+
+---
+
+### 2. Nginx Reverse Proxy (Port 443 DoH Termination)
+
+When proxying DoH through Nginx, Nginx handles HTTPS on port 443 and passes queries to `doh-server` running on port `3053`.
+
+> **Note**: Because `doh-server` serves TLS directly on its configured backend port, `proxy_pass` must use `https://` with `proxy_ssl_verify off;`.
+
+Create `/etc/nginx/sites-available/dns.example.com`:
+
+```nginx
+upstream doh_backend {
+    server 127.0.0.1:3053;
+    keepalive 64;
+}
+
+# HTTP Server (Port 80)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name dns.example.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS Server (Port 443)
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name dns.example.com;
+
+    ssl_certificate /etc/ssl/certs/dns.example.com.crt;
+    ssl_certificate_key /etc/ssl/private/dns.example.com.key;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+    }
+
+    ssl_session_cache shared:DOH_SSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets on;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    keepalive_timeout 120s;
+    keepalive_requests 10000;
+
+    client_max_body_size 10k;
+
+    location / {
+        proxy_pass https://doh_backend;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+
+        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        proxy_connect_timeout 3s;
+        proxy_send_timeout 5s;
+        proxy_read_timeout 5s;
+    }
+}
+```
+
+Enable the vhost configuration:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/dns.example.com /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+## Client Configuration
+
+* **Android (Private DNS / DoT)**:
+  `Settings` → `Network & Internet` → `Private DNS` → `Private DNS provider hostname` → `dns.example.com`
+* **Web Browsers (DoH)**:
+  `Settings` → `Privacy & Security` → `Secure DNS` → Custom Provider URL: `https://dns.example.com/dns-query`
+* **Plain DNS**:
+  Set your router or network device's primary DNS address to your server's IPv4/IPv6 address.
+
+---
+
+## Verification & Testing
+
+### 1. Plain DNS Test (UDP/TCP Port 53)
+```bash
+dig @dns.example.com example.com
+```
+
+### 2. DoT Test (TCP Port 853)
+```bash
+kdig -d @dns.example.com +tls example.com
+```
+
+### 3. DoH Native Test (HTTPS Port 443)
+```bash
+dig +https @dns.example.com example.com
+```
+
+### 4. Direct RFC 8484 DoH Curl Test
+```bash
+curl -i -H 'accept: application/dns-message' \
+  '[https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAEC](https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAEC)'
+```

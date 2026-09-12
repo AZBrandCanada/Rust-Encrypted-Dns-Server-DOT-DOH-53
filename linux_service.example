@@ -1,0 +1,24 @@
+  GNU nano 6.2                            /etc/systemd/system/doh-server.service
+[Unit]
+Description=Unified DNS Server (DoH + Port 53 UDP/TCP) - USA Node
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ryan/dns
+Environment=PORT=3053
+Environment=DOH_PORT=3053
+Environment=DOT_PORT=853
+Environment=DNS_PORT=53
+Environment=HOST=0.0.0.0
+Environment=CACHE_FILE=/home/ryan/dns/cache.json
+Environment=CERT_PATH=/etc/ssl/certs/dns.example.com.crt
+Environment=KEY_PATH=/etc/ssl/private/dns.example.com.key
+ExecStart=/home/ryan/dns/target/release/doh-server
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
