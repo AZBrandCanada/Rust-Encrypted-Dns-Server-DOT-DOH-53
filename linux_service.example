@@ -15,6 +15,8 @@ Environment=HOST=0.0.0.0
 Environment=CACHE_FILE=/home/my_user/dns/cache.json
 Environment=CERT_PATH=/etc/ssl/certs/dns.example.com.crt
 Environment=KEY_PATH=/etc/ssl/private/dns.example.com.key
+Environment=WARM_LIMIT=20000
+Environment=WARM_CONCURRENCY=6
 ExecStart=/home/my_user/dns/target/release/doh-server
 Restart=always
 RestartSec=2
