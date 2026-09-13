@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 use zip::ZipArchive;
 
+const MAX_DOWNLOAD_SIZE_BYTES: u64 = 25 * 1024 * 1024;
+
 pub const EMBEDDED_FALLBACK: &[&str] = &[
     "google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com",
     "reddit.com", "netflix.com", "bing.com", "microsoft.com", "apple.com",
@@ -75,6 +77,12 @@ async fn download_and_extract(limit: usize) -> Result<Vec<String>, Box<dyn std::
     let resp = client.get("https://tranco-list.eu/top-1m.csv.zip").send().await?;
     if !resp.status().is_success() {
         return Err(format!("Server returned HTTP {}", resp.status()).into());
+    }
+
+    if let Some(content_len) = resp.content_length() {
+        if content_len > MAX_DOWNLOAD_SIZE_BYTES {
+            return Err("Tranco download payload exceeds size limit".into());
+        }
     }
 
     let bytes = resp.bytes().await?;

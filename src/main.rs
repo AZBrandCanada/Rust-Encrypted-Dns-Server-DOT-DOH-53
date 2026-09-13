@@ -10,7 +10,8 @@ mod recursor;
 mod tls;
 mod tranco;
 
-use cache::{create_cache, load_cache_from_disk, now_secs, save_cache_to_disk, CacheEntry, DnsCache};
+use cache::{create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache};
+use dashmap::DashMap;
 use engine::AppState;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
@@ -60,10 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let domains = tranco::get_or_download_tranco(TRANCO_FILE, warm_limit).await;
             preload_domains(preloader_cache, preloader_recursor, domains, concurrency).await;
         });
-    } else {
-        tracing::info!(
-            "[WARM] Cache pre-warming is disabled (WARM_LIMIT is 0 or unset). Set WARM_LIMIT=1000 in your environment to enable."
-        );
     }
 
     let persist_cache = cache.clone();
@@ -72,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             let count = persist_cache.len();
-            save_cache_to_disk(&persist_cache, CACHE_FILE);
+            save_cache_to_disk_async(persist_cache.clone(), CACHE_FILE.to_string()).await;
             tracing::info!(entries = count, "[PERSIST] Cache synced to disk");
         }
     });
@@ -81,11 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rl_per_sec: i64 = std::env::var("RATE_LIMIT_PER_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let rate_limiter = ratelimit::RateLimiter::new(rl_capacity, rl_per_sec);
 
-    let dnssec_enforce = std::env::var("DNSSEC_ENFORCE").ok().as_deref() == Some("1");
+    // DNSSEC enforcement ON by default per RFC 4035 (set DNSSEC_ENFORCE=0 to disable)
+    let dnssec_enforce = std::env::var("DNSSEC_ENFORCE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
     if dnssec_enforce {
-        tracing::warn!(
-            "[DNSSEC] Strict enforcement ON: broken DNSSEC chains will return SERVFAIL."
-        );
+        tracing::info!("[DNSSEC] Enforcement ON: Broken/Bogus DNSSEC chains will return SERVFAIL");
+    } else {
+        tracing::warn!("[DNSSEC] Enforcement OFF: Broken/Bogus DNSSEC chains will return records with AD=0");
     }
 
     {
@@ -95,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 rl_cleanup.cleanup(Duration::from_secs(900));
-                tracing::debug!(tracked_ips = rl_cleanup.tracked_ips(), "[RATELIMIT] Cleanup pass completed");
+                tracing::debug!(tracked_subnets = rl_cleanup.tracked_subnets(), "[RATELIMIT] Cleanup pass completed");
             }
         });
     }
@@ -105,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recursor: recursor.clone(),
         rate_limiter,
         dnssec_enforce,
+        in_flight: Arc::new(DashMap::new()),
     };
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -113,35 +115,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requested_doh_port: u16 = std::env::var("DOH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
     let doh_no_tls = std::env::var("DOH_NO_TLS").ok().as_deref() == Some("1");
 
-    // --- Plain DNS: UDP + TCP on port 53 (fallback: 5053) ---
+    let udp_semaphore = Arc::new(Semaphore::new(2048));
+    let tcp_semaphore = Arc::new(Semaphore::new(512));
+    let dot_semaphore = Arc::new(Semaphore::new(512));
+
     let (udp_socket, active_dns_port) = bind_udp(&host, requested_dns_port, 5053).await?;
     let udp_socket = Arc::new(udp_socket);
     let udp_state = app_state.clone();
-    tokio::spawn(async move { dns::run_udp_listener(udp_socket, udp_state).await; });
+    let udp_sem = udp_semaphore.clone();
+    tokio::spawn(async move { dns::run_udp_listener(udp_socket, udp_state, udp_sem).await; });
 
     let (tcp_listener, _) = bind_tcp(&host, active_dns_port, 5053).await?;
     let tcp_state = app_state.clone();
-    tokio::spawn(async move { dns::run_tcp_listener(tcp_listener, tcp_state).await; });
+    let tcp_sem = tcp_semaphore.clone();
+    tokio::spawn(async move { dns::run_tcp_listener(tcp_listener, tcp_state, tcp_sem).await; });
 
-    // --- TLS Certificate (Shared by DoT and optionally DoH) ---
     let cert_path = std::env::var("CERT_PATH").unwrap_or_else(|_| "fullchain.pem".to_string());
     let key_path = std::env::var("KEY_PATH").unwrap_or_else(|_| "privkey.pem".to_string());
     let loaded_cert = tls::load_or_generate(&cert_path, &key_path)?;
 
-    if loaded_cert.is_self_signed {
-        tracing::warn!(
-            "[STARTUP] Running with a SELF-SIGNED certificate. Real clients require a publicly trusted certificate."
-        );
-    }
-
-    // --- DoT: Port 853 (fallback: 8853) ---
     let dot_tls_config = tls::dot_server_config(&loaded_cert)?;
     let dot_acceptor = TlsAcceptor::from(dot_tls_config);
     let (dot_listener, active_dot_port) = bind_tcp(&host, requested_dot_port, 8853).await?;
     let dot_state = app_state.clone();
-    tokio::spawn(async move { dot::run_dot_listener(dot_listener, dot_acceptor, dot_state).await; });
+    let dot_sem = dot_semaphore.clone();
+    tokio::spawn(async move { dot::run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await; });
 
-    // --- DoH: Port 443 (or custom DOH_PORT, fallback: 8443) ---
     let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
     drop(doh_test_sock);
 
@@ -155,19 +154,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dns_port = active_dns_port,
             dot_port = active_dot_port,
             doh_port = active_doh_port,
-            doh_mode = "plain HTTP (reverse proxy mode)",
+            doh_mode = "plain HTTP",
             "[SERVER] All listeners active"
         );
         let listener = tokio::net::TcpListener::bind(doh_addr).await?;
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(
+            let _ = axum::serve(
                 listener,
                 doh_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .await
-            {
-                tracing::error!(error = %e, "[SERVER] DoH HTTP listener failed");
-            }
+            .await;
         });
     } else {
         tracing::info!(
@@ -184,13 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
         tokio::spawn(async move {
-            if let Err(e) = axum_server::bind_rustls(doh_addr, doh_tls_config)
+            let _ = axum_server::bind_rustls(doh_addr, doh_tls_config)
                 .handle(doh_handle_for_serve)
                 .serve(doh_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-            {
-                tracing::error!(error = %e, "[SERVER] DoH HTTPS listener failed");
-            }
+                .await;
         });
     }
 
@@ -198,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("[SERVER] Shutdown requested. Saving cache...");
             doh_handle.shutdown();
-            save_cache_to_disk(&cache, CACHE_FILE);
+            save_cache_to_disk_async(cache.clone(), CACHE_FILE.to_string()).await;
             tracing::info!("[SERVER] Cache saved. Exiting cleanly.");
         }
     }
@@ -211,7 +204,7 @@ async fn bind_udp(host: &str, preferred: u16, fallback: u16) -> Result<(UdpSocke
     match UdpSocket::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(preferred, fallback, "[UDP] Permission denied for privileged port, using fallback");
+            tracing::warn!(preferred, fallback, "[UDP] Permission denied for port, using fallback");
             let s = UdpSocket::bind(format!("{}:{}", host, fallback)).await?;
             Ok((s, fallback))
         }
@@ -224,7 +217,7 @@ async fn bind_tcp(host: &str, preferred: u16, fallback: u16) -> Result<(TcpListe
     match TcpListener::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(preferred, fallback, "[TCP] Permission denied for privileged port, using fallback");
+            tracing::warn!(preferred, fallback, "[TCP] Permission denied for port, using fallback");
             let s = TcpListener::bind(format!("{}:{}", host, fallback)).await?;
             Ok((s, fallback))
         }
@@ -237,8 +230,6 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
     if total_domains == 0 {
         return;
     }
-
-    tracing::info!(domains = total_domains, concurrency, "[WARM] Beginning cache pre-warming process");
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let warmed_count = Arc::new(AtomicUsize::new(0));
@@ -262,7 +253,7 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
 
             if let Ok(name) = Name::from_str(&fqdn) {
                 for qtype in [RecordType::A, RecordType::AAAA] {
-                    let cache_key = format!("{}:{}:IN:do=0", name, qtype);
+                    let cache_key = format!("{}:{}:IN:do=0", name.to_ascii().to_lowercase(), qtype);
                     if cache_ref.contains_key(&cache_key) {
                         continue;
                     }
@@ -306,9 +297,8 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
 
     let _ = semaphore.acquire_many(concurrency as u32).await;
     tracing::info!(
-        domains_processed = total_domains,
         records_warmed = warmed_count.load(Ordering::Relaxed),
         elapsed_sec = start_time.elapsed().as_secs(),
-        "[WARM] Cache pre-warming completed"
+        "[WARM] Pre-warming completed"
     );
 }

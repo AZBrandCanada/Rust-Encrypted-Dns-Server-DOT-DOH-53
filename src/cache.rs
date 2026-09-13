@@ -81,7 +81,15 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
     }
 }
 
-pub fn save_cache_to_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
+pub async fn save_cache_to_disk_async(cache: DnsCache, path: String) {
+    tokio::task::spawn_blocking(move || {
+        save_cache_to_disk_sync(&cache, &path);
+    })
+    .await
+    .unwrap_or_default();
+}
+
+pub fn save_cache_to_disk_sync<P: AsRef<Path>>(cache: &DnsCache, path: P) {
     let path = path.as_ref();
     let tmp_path = path.with_extension("tmp");
     match File::create(&tmp_path) {

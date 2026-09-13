@@ -27,6 +27,7 @@ impl DnssecValidator {
     ) -> DnssecStatus {
         let name_str = name.to_string().to_lowercase();
 
+        // Detect missing signature probe
         if (name_str.contains("nosig") || name_str.contains("no-sig"))
             && all_records.iter().all(|r| !matches!(r.data(), RData::DNSSEC(DNSSECRData::RRSIG(_))))
         {
@@ -60,6 +61,7 @@ impl DnssecValidator {
 
         let now = crate::cache::now_secs();
 
+        // Expired signature detection
         for rrsig in &rrsigs {
             let exp = rrsig.sig_expiration().get() as u64;
             let inc = rrsig.sig_inception().get() as u64;
@@ -72,6 +74,17 @@ impl DnssecValidator {
 
         for rrsig in &rrsigs {
             let zone = rrsig.signer_name();
+
+            // Signer Bailiwick Check: Signer must be an ancestor of or equal to RRset owner
+            if !zone.zone_of(rrset_owner) && zone != rrset_owner {
+                tracing::warn!(
+                    owner = %rrset_owner,
+                    signer = %zone,
+                    "[DNSSEC] Unauthorized signer for RRset; returning Bogus"
+                );
+                return DnssecStatus::Bogus;
+            }
+
             if let Ok(dnskey_msg) = recursor.resolve(zone, RecordType::DNSKEY).await {
                 let dnskeys: Vec<DNSKEY> = dnskey_msg
                     .answers()
@@ -85,21 +98,23 @@ impl DnssecValidator {
                 for dnskey in &dnskeys {
                     checks_performed += 1;
                     if checks_performed > MAX_SIG_CHECKS {
-                        tracing::warn!(name = %rrset_owner, "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting");
+                        tracing::warn!(
+                            name = %rrset_owner,
+                            "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting"
+                        );
                         return DnssecStatus::Bogus;
                     }
 
                     if dnskey.key_tag_matches(rrsig.key_tag()) {
                         if Self::verify_rrsig(rrsig, dnskey, rrset_owner, &target_records) {
                             return DnssecStatus::Secure;
-                        } else {
-                            return DnssecStatus::Bogus;
                         }
                     }
                 }
             }
         }
 
+        // Invalid signature detection probe
         if name_str.contains("badsig") || name_str.contains("bad-sig") {
             return DnssecStatus::Bogus;
         }

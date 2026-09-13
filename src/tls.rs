@@ -33,8 +33,7 @@ pub fn load_or_generate(cert_path: &str, key_path: &str) -> Result<LoadedCert, B
     }
 
     tracing::warn!(
-        "[TLS] No cert/key found at '{}' / '{}'. Generating a SELF-SIGNED dev certificate. \
-         DoT and DoH will NOT work for real clients until a publicly trusted cert is installed.",
+        "[TLS] No cert/key found at '{}' / '{}'. Generating a SELF-SIGNED dev certificate.",
         cert_path,
         key_path
     );
@@ -47,7 +46,21 @@ pub fn load_or_generate(cert_path: &str, key_path: &str) -> Result<LoadedCert, B
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     let _ = std::fs::write("selfsigned_cert.pem", &cert_pem);
-    let _ = std::fs::write("selfsigned_key.pem", &key_pem);
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        if let Ok(mut f) = options.open("selfsigned_key.pem") {
+            let _ = f.write_all(key_pem.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write("selfsigned_key.pem", &key_pem);
+    }
 
     let certs =
         rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;

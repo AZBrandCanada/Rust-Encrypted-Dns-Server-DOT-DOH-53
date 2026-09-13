@@ -3,8 +3,8 @@ use crate::cache::{now_secs, CacheEntry, DnsCache};
 use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::ratelimit::{RateLimiter, RrlAction};
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
+use dashmap::DashMap;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub struct AppState {
     pub recursor: Arc<RecursiveResolver>,
     pub rate_limiter: Arc<RateLimiter>,
     pub dnssec_enforce: bool,
+    pub in_flight: Arc<DashMap<String, ()>>,
 }
 
 fn is_cacheable(msg: &Message) -> bool {
@@ -43,13 +44,14 @@ pub async fn process_dns_wire(
     let qname = query.name().clone();
     let qtype = query.query_type();
 
-    // Determine client's EDNS buffer size limit (RFC 1035: 512 without EDNS; up to 1232 safe MTU with EDNS)
-    let client_max_payload = req_msg
-        .edns()
-        .map(|e| (e.max_payload() as usize).clamp(512, 1232))
-        .unwrap_or(512);
+    let (client_max_payload, client_dnssec_ok) = match req_msg.extensions().as_ref() {
+        Some(e) => (
+            (e.max_payload() as usize).clamp(512, 1232),
+            e.flags().dnssec_ok,
+        ),
+        None => (512, false),
+    };
 
-    // Universal Anti-Amplification & RRL Check (Per-IP)
     match state.rate_limiter.check_query(protocol, client_ip, &qname, qtype) {
         RrlAction::Allow => {}
         RrlAction::Truncate => {
@@ -58,7 +60,7 @@ pub async fn process_dns_wire(
                 client = %client_ip,
                 domain = %qname,
                 rtype = %qtype,
-                "[SECURITY] Challenging client with TC=1 (45 bytes)"
+                "[SECURITY] Challenging client with TC=1"
             );
             return make_truncated_wire(req_msg.id(), Some(query));
         }
@@ -68,23 +70,19 @@ pub async fn process_dns_wire(
                 client = %client_ip,
                 domain = %qname,
                 rtype = %qtype,
-                "[SECURITY] Flood dropped (0 bytes)"
+                "[SECURITY] Rate limit dropped"
             );
             return Vec::new();
         }
     }
 
-    let cache_key = format!("{}:{}:IN:do=0", qname, qtype);
-    let now = now_secs();
-
-    tracing::info!(
-        protocol,
-        client = %client_ip,
-        domain = %qname,
-        rtype = %qtype,
-        id = req_msg.id(),
-        "[QUERY] Received DNS query"
+    let cache_key = format!(
+        "{}:{}:IN:do={}",
+        qname.to_ascii().to_lowercase(),
+        qtype,
+        if client_dnssec_ok { 1 } else { 0 }
     );
+    let now = now_secs();
 
     // 1. Cache hit path
     if let Some(entry) = state.cache.get(&cache_key) {
@@ -92,80 +90,55 @@ pub async fn process_dns_wire(
         let is_stale = age >= entry.min_ttl as u64;
 
         if is_stale {
-            tracing::info!(
-                protocol,
-                client = %client_ip,
-                domain = %qname,
-                rtype = %qtype,
-                age_secs = age,
-                ttl = entry.min_ttl,
-                "[CACHE-STALE] Serving stale cache; revalidating in background"
-            );
+            if state.in_flight.insert(cache_key.clone(), ()).is_none() {
+                let cache_clone = state.cache.clone();
+                let recursor_clone = state.recursor.clone();
+                let key_clone = cache_key.clone();
+                let name_clone = qname.clone();
+                let in_flight_clone = state.in_flight.clone();
 
-            let cache_clone = state.cache.clone();
-            let recursor_clone = state.recursor.clone();
-            let key_clone = cache_key.clone();
-            let name_clone = qname.clone();
-
-            tokio::spawn(async move {
-                if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
-                    if !fresh_msg.answers().is_empty() {
-                        let all_records: Vec<_> = fresh_msg.answers().to_vec();
-                        let status = DnssecValidator::validate_answer(
-                            &recursor_clone,
-                            &name_clone,
-                            qtype,
-                            &all_records,
-                        )
-                        .await;
-                        fresh_msg.set_authentic_data(status == DnssecStatus::Secure);
-                    }
-                    if is_cacheable(&fresh_msg) {
-                        if let Ok(wire) = fresh_msg.to_bytes() {
-                            let ttl = calculate_min_ttl(&fresh_msg);
-                            let cur_time = now_secs();
-                            cache_clone.insert(
-                                key_clone,
-                                CacheEntry {
-                                    raw_wire: wire,
-                                    min_ttl: ttl,
-                                    cached_at: cur_time,
-                                    last_revalidated_at: cur_time,
-                                },
-                            );
+                tokio::spawn(async move {
+                    if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
+                        if !fresh_msg.answers().is_empty() {
+                            let all_records: Vec<_> = fresh_msg.answers().to_vec();
+                            let status = DnssecValidator::validate_answer(
+                                &recursor_clone,
+                                &name_clone,
+                                qtype,
+                                &all_records,
+                            )
+                            .await;
+                            fresh_msg.set_authentic_data(status == DnssecStatus::Secure);
                         }
-                    } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
-                        existing.last_revalidated_at = now_secs();
+                        if is_cacheable(&fresh_msg) {
+                            if let Ok(wire) = fresh_msg.to_bytes() {
+                                let ttl = calculate_min_ttl(&fresh_msg);
+                                let cur_time = now_secs();
+                                cache_clone.insert(
+                                    key_clone.clone(),
+                                    CacheEntry {
+                                        raw_wire: wire,
+                                        min_ttl: ttl,
+                                        cached_at: cur_time,
+                                        last_revalidated_at: cur_time,
+                                    },
+                                );
+                            }
+                        } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
+                            existing.last_revalidated_at = now_secs();
+                        }
                     }
-                }
-            });
-        } else {
-            tracing::info!(
-                protocol,
-                client = %client_ip,
-                domain = %qname,
-                rtype = %qtype,
-                latency_us = start.elapsed().as_micros(),
-                ttl = entry.min_ttl,
-                "[CACHE-HIT] In-memory cache hit"
-            );
+                    in_flight_clone.remove(&key_clone);
+                });
+            }
         }
 
-        // Amplification Guard: Challenge if UDP response exceeds client's negotiated buffer
         if state.rate_limiter.should_challenge_large_response(
             protocol,
             client_ip,
             entry.raw_wire.len(),
             client_max_payload,
         ) {
-            tracing::warn!(
-                protocol,
-                client = %client_ip,
-                domain = %qname,
-                resp_bytes = entry.raw_wire.len(),
-                max_allowed = client_max_payload,
-                "[SECURITY] Large UDP response challenged with TC=1"
-            );
             return make_truncated_wire(req_msg.id(), Some(query));
         }
 
@@ -178,21 +151,11 @@ pub async fn process_dns_wire(
     }
 
     // 2. Cache miss path
-    tracing::info!(
-        protocol,
-        client = %client_ip,
-        domain = %qname,
-        rtype = %qtype,
-        "[RECURSE] Cache miss; resolving from root servers"
-    );
-
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
-            let mut dnssec_status = DnssecStatus::Insecure;
-
             if !resp_msg.answers().is_empty() {
                 let all_records: Vec<_> = resp_msg.answers().to_vec();
-                dnssec_status = DnssecValidator::validate_answer(
+                let dnssec_status = DnssecValidator::validate_answer(
                     &state.recursor,
                     &qname,
                     qtype,
@@ -222,9 +185,8 @@ pub async fn process_dns_wire(
                                 "[DNSSEC] Bogus signature detected; returning SERVFAIL"
                             );
                             return make_servfail_wire(req_msg.id(), Some(query));
-                        } else {
-                            resp_msg.set_authentic_data(false);
                         }
+                        resp_msg.set_authentic_data(false);
                     }
                 }
             }
@@ -234,9 +196,6 @@ pub async fn process_dns_wire(
                 Ok(w) => w,
                 Err(_) => return make_servfail_wire(req_msg.id(), Some(query)),
             };
-
-            let answers_count = resp_msg.answers().len();
-            let rcode = resp_msg.response_code();
 
             if is_cacheable(&resp_msg) {
                 let ttl = calculate_min_ttl(&resp_msg);
@@ -256,9 +215,6 @@ pub async fn process_dns_wire(
                 client = %client_ip,
                 domain = %qname,
                 rtype = %qtype,
-                rcode = %rcode,
-                answers = answers_count,
-                dnssec = ?dnssec_status,
                 latency_ms = start.elapsed().as_millis(),
                 "[RESOLVED] Resolution completed"
             );
@@ -269,14 +225,6 @@ pub async fn process_dns_wire(
                 wire.len(),
                 client_max_payload,
             ) {
-                tracing::warn!(
-                    protocol,
-                    client = %client_ip,
-                    domain = %qname,
-                    resp_bytes = wire.len(),
-                    max_allowed = client_max_payload,
-                    "[SECURITY] Large UDP resolved response challenged with TC=1"
-                );
                 return make_truncated_wire(req_msg.id(), Some(query));
             }
 
@@ -289,7 +237,6 @@ pub async fn process_dns_wire(
                 domain = %qname,
                 rtype = %qtype,
                 error = %err,
-                latency_ms = start.elapsed().as_millis(),
                 "[ERROR] Recursive resolution failed; returning SERVFAIL"
             );
             make_servfail_wire(req_msg.id(), Some(query))

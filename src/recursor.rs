@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -36,9 +35,8 @@ pub const ROOT_SERVERS: &[&str] = &[
     "202.12.27.33",   // m.root-servers.net
 ];
 
-const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
-const TCP_TIMEOUT: Duration = Duration::from_millis(2000);
-const MAX_PARALLEL_SERVERS: usize = 4;
+const QUERY_TIMEOUT: Duration = Duration::from_millis(2000);
+const TCP_TIMEOUT: Duration = Duration::from_millis(2500);
 const MAX_DEPTH: usize = 16;
 const MAX_STEPS: usize = 16;
 const MIN_DELEGATION_TTL: u64 = 300;
@@ -54,7 +52,7 @@ pub enum RecursorError {
     AllNameserversFailed,
     #[error("Failed to resolve nameserver glue IP")]
     GlueResolutionFailed,
-    #[error("Delegation made no forward progress (likely misconfigured zone)")]
+    #[error("Delegation made no forward progress")]
     NoProgress,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -105,15 +103,16 @@ impl RecursiveResolver {
                 start_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
             current_servers.shuffle(&mut rand::thread_rng());
 
-            let mut last_zone: Option<String> = None;
+            let mut last_zone: Option<Name> = None;
             let mut bailiwick: Name = Name::root();
 
             for _step in 0..MAX_STEPS {
-                let response = match Self::query_servers_parallel(&current_servers, name, rtype).await {
+                let response = match Self::query_servers_with_fallback(&current_servers, name, rtype).await {
                     Some(r) => r,
                     None => return Err(RecursorError::AllNameserversFailed),
                 };
 
+                // 1. Positive answer or CNAME
                 if !response.answers().is_empty() {
                     let has_target_type = response
                         .answers()
@@ -151,10 +150,15 @@ impl RecursiveResolver {
                     }
                 }
 
-                if response.response_code() == ResponseCode::NXDomain {
+                // 2. Final negative or authoritative response (NXDomain, Authoritative AA=1, or SOA present)
+                if response.response_code() == ResponseCode::NXDomain
+                    || response.authoritative()
+                    || response.name_servers().iter().any(|r| matches!(r.data(), RData::SOA(_)))
+                {
                     return Ok(response);
                 }
 
+                // 3. Referral processing
                 if response.name_servers().is_empty() {
                     return Ok(response);
                 }
@@ -178,42 +182,67 @@ impl RecursiveResolver {
                 let zone_name = response
                     .name_servers()
                     .first()
-                    .map(|r| r.name().to_string().to_lowercase());
+                    .map(|r| r.name().clone());
 
-                if zone_name.is_some() && zone_name == last_zone {
-                    return Err(RecursorError::NoProgress);
+                if let Some(ref z) = zone_name {
+                    if last_zone.as_ref() == Some(z) {
+                        return Err(RecursorError::NoProgress);
+                    }
                 }
 
+                // Verify bailiwick boundaries
+                let mut valid_delegation_zone: Option<Name> = None;
+                if let Some(ref z) = zone_name {
+                    let is_child_of_target = z.zone_of(name);
+                    let is_within_bailiwick = bailiwick.is_root() || bailiwick.zone_of(z) || bailiwick == *z;
+                    if is_child_of_target && is_within_bailiwick {
+                        valid_delegation_zone = Some(z.clone());
+                    } else {
+                        tracing::warn!(
+                            delegation = %z,
+                            target = %name,
+                            bailiwick = %bailiwick,
+                            "[SECURITY] Out-of-bailiwick delegation rejected"
+                        );
+                    }
+                }
+
+                let active_delegation = match valid_delegation_zone {
+                    Some(z) => z,
+                    None => return Err(RecursorError::NoProgress),
+                };
+
+                // Prioritize IPv4 glue for upstream authoritative server communication
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
                         continue;
                     }
-                    if !is_in_bailiwick(add.name(), &bailiwick) {
-                        continue;
-                    }
                     match add.data() {
                         RData::A(a) => next_ips.push(IpAddr::V4(a.0)),
-                        RData::AAAA(a) => next_ips.push(IpAddr::V6(a.0)),
+                        RData::AAAA(a) => {
+                            if next_ips.is_empty() {
+                                next_ips.push(IpAddr::V6(a.0));
+                            }
+                        }
                         _ => {}
                     }
                 }
 
+                // If glue was omitted, iteratively resolve nameserver IPs
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
-                        let key = format!("ns:{}", ns_name.to_string().to_lowercase());
-                        if visited.contains(&key) {
-                            continue;
-                        }
-                        visited.insert(key);
-
-                        if let Ok(ns_resp) = self
-                            .resolve_internal(ns_name, RecordType::A, depth + 1, visited)
-                            .await
-                        {
-                            for ans in ns_resp.answers() {
-                                if let RData::A(a) = ans.data() {
-                                    next_ips.push(IpAddr::V4(a.0));
+                        let key_a = format!("ns:a:{}", ns_name.to_string().to_lowercase());
+                        if !visited.contains(&key_a) {
+                            visited.insert(key_a);
+                            if let Ok(ns_resp) = self
+                                .resolve_internal(ns_name, RecordType::A, depth + 1, visited)
+                                .await
+                            {
+                                for ans in ns_resp.answers() {
+                                    if let RData::A(a) = ans.data() {
+                                        next_ips.push(IpAddr::V4(a.0));
+                                    }
                                 }
                             }
                         }
@@ -227,23 +256,18 @@ impl RecursiveResolver {
                     return Err(RecursorError::GlueResolutionFailed);
                 }
 
-                if let Some(zone) = &zone_name {
-                    let ttl = delegation_ttl(&response);
-                    self.delegation_cache.insert(
-                        zone.clone(),
-                        DelegationEntry {
-                            servers: next_ips.clone(),
-                            expires_at: now_secs() + ttl,
-                        },
-                    );
-                }
+                let ttl = delegation_ttl(&response);
+                self.delegation_cache.insert(
+                    active_delegation.to_string().to_lowercase(),
+                    DelegationEntry {
+                        servers: next_ips.clone(),
+                        expires_at: now_secs() + ttl,
+                    },
+                );
 
-                if let Some(zone) = &zone_name {
-                    if let Ok(zone_as_name) = Name::from_str(zone) {
-                        bailiwick = zone_as_name;
-                    }
-                }
-                last_zone = zone_name;
+                bailiwick = active_delegation.clone();
+                last_zone = Some(active_delegation);
+
                 next_ips.shuffle(&mut rand::thread_rng());
                 current_servers = next_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
             }
@@ -270,16 +294,17 @@ impl RecursiveResolver {
         None
     }
 
-    async fn query_servers_parallel(
+    async fn query_servers_with_fallback(
         servers: &[SocketAddr],
         name: &Name,
         rtype: RecordType,
     ) -> Option<Message> {
-        let candidates: Vec<SocketAddr> = servers.iter().take(MAX_PARALLEL_SERVERS).cloned().collect();
-        if candidates.is_empty() {
+        if servers.is_empty() {
             return None;
         }
 
+        let batch_size = 3;
+        let candidates: Vec<SocketAddr> = servers.iter().take(batch_size).cloned().collect();
         let mut set = JoinSet::new();
         for addr in candidates {
             let name = name.clone();
@@ -295,6 +320,26 @@ impl RecursiveResolver {
                 }
             }
         }
+
+        if servers.len() > batch_size {
+            let fallback: Vec<SocketAddr> = servers.iter().skip(batch_size).take(batch_size).cloned().collect();
+            let mut fallback_set = JoinSet::new();
+            for addr in fallback {
+                let name = name.clone();
+                fallback_set.spawn(async move { Self::query_socket(addr, &name, rtype).await });
+            }
+
+            while let Some(joined) = fallback_set.join_next().await {
+                if let Ok(Ok(msg)) = joined {
+                    if msg.response_code() != ResponseCode::Refused
+                        && msg.response_code() != ResponseCode::ServFail
+                    {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -304,8 +349,6 @@ impl RecursiveResolver {
         rtype: RecordType,
     ) -> Result<Message, RecursorError> {
         let txid: u16 = rand::thread_rng().gen();
-        let sent_name_str = randomize_case(&name.to_ascii());
-        let sent_name = Name::from_str(&sent_name_str).unwrap_or_else(|_| name.clone());
 
         let mut query_msg = Message::new();
         query_msg.set_id(txid);
@@ -319,14 +362,15 @@ impl RecursiveResolver {
         query_msg.set_edns(edns);
 
         let mut query = Query::new();
-        query.set_name(sent_name.clone());
+        query.set_name(name.clone());
         query.set_query_type(rtype);
         query.set_query_class(DNSClass::IN);
         query_msg.add_query(query);
 
         let req_bytes = query_msg.to_bytes()?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = UdpSocket::bind(bind_addr).await?;
         socket.connect(addr).await?;
         socket.send(&req_bytes).await?;
 
@@ -338,7 +382,7 @@ impl RecursiveResolver {
         let mut decoder = BinDecoder::new(&buf[..n]);
         let response = Message::read(&mut decoder)?;
 
-        if !response_matches(&response, txid, &sent_name, rtype) {
+        if !response_matches(&response, txid, name, rtype) {
             return Err(RecursorError::AllNameserversFailed);
         }
 
@@ -360,7 +404,7 @@ impl RecursiveResolver {
             let mut tcp_decoder = BinDecoder::new(&tcp_buf);
             let tcp_response = Message::read(&mut tcp_decoder)?;
 
-            if !response_matches(&tcp_response, txid, &sent_name, rtype) {
+            if !response_matches(&tcp_response, txid, name, rtype) {
                 return Err(RecursorError::AllNameserversFailed);
             }
             return Ok(tcp_response);
@@ -370,44 +414,21 @@ impl RecursiveResolver {
     }
 }
 
-fn randomize_case(name: &str) -> String {
-    let mut rng = rand::thread_rng();
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphabetic() && rng.gen_bool(0.5) {
-                if c.is_ascii_uppercase() {
-                    c.to_ascii_lowercase()
-                } else {
-                    c.to_ascii_uppercase()
-                }
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-fn response_matches(response: &Message, txid: u16, sent_name: &Name, rtype: RecordType) -> bool {
-    if response.id() != txid {
-        return false;
-    }
-    if response.message_type() != MessageType::Response {
+fn response_matches(
+    response: &Message,
+    txid: u16,
+    sent_name: &Name,
+    rtype: RecordType,
+) -> bool {
+    if response.id() != txid || response.message_type() != MessageType::Response {
         return false;
     }
     let Some(q) = response.queries().first() else { return false };
     if q.query_type() != rtype || q.query_class() != DNSClass::IN {
         return false;
     }
-    q.name() == sent_name
-}
 
-fn is_in_bailiwick(name: &Name, zone: &Name) -> bool {
-    if zone.is_root() {
-        return true;
-    }
-    let name_s = name.to_string().to_lowercase();
-    let zone_s = zone.to_string().to_lowercase();
-    name_s == zone_s || name_s.ends_with(&format!(".{}", zone_s))
+    q.name() == sent_name
 }
 
 pub fn calculate_min_ttl(msg: &Message) -> u32 {
