@@ -4,6 +4,7 @@ use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::ratelimit::RateLimiter;
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -46,6 +47,19 @@ pub async fn process_dns_wire(
 
     let qname = query.name().clone();
     let qtype = query.query_type();
+
+    // Defense against DNS Amplification / Reflection attacks:
+    // Drop ANY queries over unauthenticated plain UDP. Normal clients never query ANY.
+    if protocol == "UDP" && qtype == RecordType::ANY {
+        tracing::warn!(
+            client = %client_ip,
+            domain = %qname,
+            id = req_msg.id(),
+            "[SECURITY] Dropped plain UDP ANY query (amplification mitigation)"
+        );
+        return Vec::new();
+    }
+
     let cache_key = format!("{}:{}:IN:do=0", qname, qtype);
     let now = now_secs();
 
