@@ -1,27 +1,17 @@
 // src/ratelimit.rs
-//
-// Two things this defends against:
-//
-//   1. Someone hammering the resolver directly (abuse, or a bug in a
-//      client retrying too aggressively).
-//   2. Using an open UDP DNS resolver as a reflection/amplification
-//      vector against a third party — the classic shape is: attacker
-//      spoofs a victim's IP as the query source, sends a query whose
-//      answer is much bigger than the query, resolver blasts the big
-//      answer at the spoofed (victim) address. Rate limiting per
-//      apparent source IP caps how much amplification a single spoofed
-//      identity can extract, even though it can't stop spoofing itself
-//      (nothing server-side can — that requires BCP38 filtering
-//      upstream, which is out of scope for this binary).
-//
-// This is a simple token bucket per source IP, with periodic cleanup so
-// memory doesn't grow unbounded from one-off/spoofed source addresses.
-
 use dashmap::DashMap;
-use std::net::IpAddr;
+use hickory_proto::rr::{Name, RecordType};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RrlAction {
+    Allow,
+    Truncate,
+    Drop,
+}
 
 struct Bucket {
     tokens: AtomicI64,
@@ -29,68 +19,151 @@ struct Bucket {
     last_seen_millis: AtomicI64,
 }
 
+struct DomainRateBucket {
+    count: AtomicI64,
+    last_reset_sec: AtomicI64,
+}
+
 pub struct RateLimiter {
-    buckets: DashMap<IpAddr, Bucket>,
+    subnet_buckets: DashMap<IpAddr, Bucket>,
+    rrl_buckets: DashMap<String, DomainRateBucket>,
     capacity: i64,
     refill_per_sec: i64,
 }
 
 impl RateLimiter {
-    /// `capacity`: max burst size. `refill_per_sec`: sustained queries/sec
-    /// allowed per source IP after the burst is used up.
     pub fn new(capacity: i64, refill_per_sec: i64) -> Arc<Self> {
         Arc::new(Self {
-            buckets: DashMap::new(),
+            subnet_buckets: DashMap::new(),
+            rrl_buckets: DashMap::new(),
             capacity,
             refill_per_sec,
         })
     }
 
-    /// Returns true if this request is allowed, false if it should be
-    /// dropped (no response at all — replying to a rate-limited/likely-
-    /// spoofed source just adds to the amplification problem).
-    pub fn allow(&self, ip: IpAddr) -> bool {
-        let now = now_millis();
+    pub fn to_subnet(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => {
+                let oct = v4.octets();
+                IpAddr::V4(Ipv4Addr::new(oct[0], oct[1], oct[2], 0))
+            }
+            IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(seg[0], seg[1], seg[2], 0, 0, 0, 0, 0))
+            }
+        }
+    }
 
-        let entry = self.buckets.entry(ip).or_insert_with(|| Bucket {
+    pub fn check_query(
+        &self,
+        protocol: &str,
+        client_ip: IpAddr,
+        qname: &Name,
+        qtype: RecordType,
+    ) -> RrlAction {
+        if client_ip.is_loopback() {
+            return RrlAction::Allow;
+        }
+
+        if protocol != "UDP" {
+            return RrlAction::Allow;
+        }
+
+        if qtype == RecordType::ANY {
+            return RrlAction::Drop;
+        }
+
+        let subnet = Self::to_subnet(client_ip);
+        let now_ms = now_millis();
+        let now_s = now_ms / 1000;
+
+        let bucket = self.subnet_buckets.entry(subnet).or_insert_with(|| Bucket {
             tokens: AtomicI64::new(self.capacity),
-            last_refill_millis: AtomicI64::new(now),
-            last_seen_millis: AtomicI64::new(now),
+            last_refill_millis: AtomicI64::new(now_ms),
+            last_seen_millis: AtomicI64::new(now_ms),
         });
 
-        entry.last_seen_millis.store(now, Ordering::Relaxed);
+        bucket.last_seen_millis.store(now_ms, Ordering::Relaxed);
 
-        let last_refill = entry.last_refill_millis.load(Ordering::Relaxed);
-        let elapsed_ms = (now - last_refill).max(0);
+        let last_refill = bucket.last_refill_millis.load(Ordering::Relaxed);
+        let elapsed_ms = (now_ms - last_refill).max(0);
         if elapsed_ms > 0 {
             let new_tokens = (elapsed_ms * self.refill_per_sec) / 1000;
             if new_tokens > 0 {
-                let current = entry.tokens.load(Ordering::Relaxed);
+                let current = bucket.tokens.load(Ordering::Relaxed);
                 let updated = (current + new_tokens).min(self.capacity);
-                entry.tokens.store(updated, Ordering::Relaxed);
-                entry.last_refill_millis.store(now, Ordering::Relaxed);
+                bucket.tokens.store(updated, Ordering::Relaxed);
+                bucket.last_refill_millis.store(now_ms, Ordering::Relaxed);
             }
         }
 
-        let current = entry.tokens.load(Ordering::Relaxed);
-        if current > 0 {
-            entry.tokens.fetch_sub(1, Ordering::Relaxed);
-            true
+        let current_tokens = bucket.tokens.load(Ordering::Relaxed);
+        if current_tokens <= 0 {
+            return RrlAction::Truncate;
+        }
+        bucket.tokens.fetch_sub(1, Ordering::Relaxed);
+
+        let rrl_key = format!("{}:{}:{}", subnet, qname.to_string().to_lowercase(), qtype);
+        let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| DomainRateBucket {
+            count: AtomicI64::new(0),
+            last_reset_sec: AtomicI64::new(now_s),
+        });
+
+        let last_reset = domain_entry.last_reset_sec.load(Ordering::Relaxed);
+        if now_s > last_reset {
+            domain_entry.count.store(1, Ordering::Relaxed);
+            domain_entry.last_reset_sec.store(now_s, Ordering::Relaxed);
+            return RrlAction::Allow;
+        }
+
+        let query_rate = domain_entry.count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if query_rate <= 3 {
+            RrlAction::Allow
+        } else if query_rate <= 6 {
+            RrlAction::Truncate
         } else {
-            false
+            RrlAction::Drop
         }
     }
 
-    /// Drop buckets for source IPs we haven't seen in a while, so a churn
-    /// of one-off/spoofed addresses doesn't grow this map forever.
+    pub fn should_challenge_large_response(
+        &self,
+        protocol: &str,
+        client_ip: IpAddr,
+        resp_bytes: usize,
+    ) -> bool {
+        if protocol != "UDP" || client_ip.is_loopback() {
+            return false;
+        }
+
+        if resp_bytes > 512 {
+            let subnet = Self::to_subnet(client_ip);
+            if let Some(entry) = self.subnet_buckets.get(&subnet) {
+                if entry.tokens.load(Ordering::Relaxed) < (self.capacity / 2) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn cleanup(&self, max_age: Duration) {
-        let cutoff = now_millis() - max_age.as_millis() as i64;
-        self.buckets
-            .retain(|_, bucket| bucket.last_seen_millis.load(Ordering::Relaxed) >= cutoff);
+        let cutoff_ms = now_millis() - max_age.as_millis() as i64;
+        let cutoff_s = cutoff_ms / 1000;
+
+        self.subnet_buckets
+            .retain(|_, b| b.last_seen_millis.load(Ordering::Relaxed) >= cutoff_ms);
+        self.rrl_buckets
+            .retain(|_, b| b.last_reset_sec.load(Ordering::Relaxed) >= cutoff_s);
+    }
+
+    pub fn tracked_subnets(&self) -> usize {
+        self.subnet_buckets.len()
     }
 
     pub fn tracked_sources(&self) -> usize {
-        self.buckets.len()
+        self.tracked_subnets()
     }
 }
 

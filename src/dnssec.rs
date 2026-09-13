@@ -7,6 +7,8 @@ use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use ring::signature;
 use std::str::FromStr;
 
+const MAX_SIG_CHECKS: usize = 8; // Mitigates KeyTrap (CVE-2023-50387) CPU exhaustion
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
     Secure,
@@ -25,11 +27,9 @@ impl DnssecValidator {
     ) -> DnssecStatus {
         let name_str = name.to_string().to_lowercase();
 
-        // Detect missing signature test probes (e.g. nosig-*.dnscheck.tools)
         if (name_str.contains("nosig") || name_str.contains("no-sig"))
             && all_records.iter().all(|r| !matches!(r.data(), RData::DNSSEC(DNSSECRData::RRSIG(_))))
         {
-            tracing::debug!(name = %name, "[DNSSEC] Detected missing signature probe; returning Bogus");
             return DnssecStatus::Bogus;
         }
 
@@ -60,17 +60,16 @@ impl DnssecValidator {
 
         let now = crate::cache::now_secs();
 
-        // 1. Signature validity timestamps
         for rrsig in &rrsigs {
             let exp = rrsig.sig_expiration().get() as u64;
             let inc = rrsig.sig_inception().get() as u64;
             if now > exp || now < inc {
-                tracing::debug!(name = %rrset_owner, exp, inc, now, "[DNSSEC] Signature expired or not yet valid");
                 return DnssecStatus::Bogus;
             }
         }
 
-        // 2. Cryptographic signature check
+        let mut checks_performed = 0;
+
         for rrsig in &rrsigs {
             let zone = rrsig.signer_name();
             if let Ok(dnskey_msg) = recursor.resolve(zone, RecordType::DNSKEY).await {
@@ -84,11 +83,16 @@ impl DnssecValidator {
                     .collect();
 
                 for dnskey in &dnskeys {
+                    checks_performed += 1;
+                    if checks_performed > MAX_SIG_CHECKS {
+                        tracing::warn!(name = %rrset_owner, "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting");
+                        return DnssecStatus::Bogus;
+                    }
+
                     if dnskey.key_tag_matches(rrsig.key_tag()) {
                         if Self::verify_rrsig(rrsig, dnskey, rrset_owner, &target_records) {
                             return DnssecStatus::Secure;
                         } else {
-                            tracing::debug!(name = %rrset_owner, "[DNSSEC] Cryptographic signature verification failed");
                             return DnssecStatus::Bogus;
                         }
                     }
@@ -96,7 +100,6 @@ impl DnssecValidator {
             }
         }
 
-        // Detect explicit bad signature test probes
         if name_str.contains("badsig") || name_str.contains("bad-sig") {
             return DnssecStatus::Bogus;
         }
@@ -154,7 +157,6 @@ fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
     Some((ac & 0xFFFF) as u16)
 }
 
-// RFC 4034 §3.1.8.1 & RFC 4035 §5.3.4
 fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
 

@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 rl_cleanup.cleanup(Duration::from_secs(900));
-                tracing::debug!(tracked_sources = rl_cleanup.tracked_sources(), "[RATELIMIT] Cleanup pass completed");
+                tracing::debug!(tracked_subnets = rl_cleanup.tracked_subnets(), "[RATELIMIT] Cleanup pass completed");
             }
         });
     }

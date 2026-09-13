@@ -1,10 +1,9 @@
 // src/engine.rs
 use crate::cache::{now_secs, CacheEntry, DnsCache};
 use crate::dnssec::{DnssecStatus, DnssecValidator};
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{RateLimiter, RrlAction};
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -28,11 +27,6 @@ pub async fn process_dns_wire(
     protocol: &'static str,
     client_ip: IpAddr,
 ) -> Vec<u8> {
-    if !state.rate_limiter.allow(client_ip) {
-        tracing::warn!(protocol, client_ip = %client_ip, "[RATELIMIT] Dropped query exceeding rate limit");
-        return Vec::new();
-    }
-
     let start = Instant::now();
     let mut decoder = BinDecoder::new(req_wire);
     let req_msg = match Message::read(&mut decoder) {
@@ -48,16 +42,29 @@ pub async fn process_dns_wire(
     let qname = query.name().clone();
     let qtype = query.query_type();
 
-    // Defense against DNS Amplification / Reflection attacks:
-    // Drop ANY queries over unauthenticated plain UDP. Normal clients never query ANY.
-    if protocol == "UDP" && qtype == RecordType::ANY {
-        tracing::warn!(
-            client = %client_ip,
-            domain = %qname,
-            id = req_msg.id(),
-            "[SECURITY] Dropped plain UDP ANY query (amplification mitigation)"
-        );
-        return Vec::new();
+    // Universal Anti-Amplification & RRL Check
+    match state.rate_limiter.check_query(protocol, client_ip, &qname, qtype) {
+        RrlAction::Allow => {}
+        RrlAction::Truncate => {
+            tracing::warn!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                "[SECURITY] RRL threshold reached; challenging client with TC=1 (45 bytes)"
+            );
+            return make_truncated_wire(req_msg.id(), Some(query));
+        }
+        RrlAction::Drop => {
+            tracing::warn!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                "[SECURITY] Flood threshold exceeded; dropped query (0 bytes)"
+            );
+            return Vec::new();
+        }
     }
 
     let cache_key = format!("{}:{}:IN:do=0", qname, qtype);
@@ -135,6 +142,18 @@ pub async fn process_dns_wire(
                 ttl = entry.min_ttl,
                 "[CACHE-HIT] In-memory cache hit"
             );
+        }
+
+        // Amplification Guard: Challenge large UDP responses if volume is high
+        if state.rate_limiter.should_challenge_large_response(protocol, client_ip, entry.raw_wire.len()) {
+            tracing::warn!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                resp_bytes = entry.raw_wire.len(),
+                "[SECURITY] Large UDP cache hit challenged with TC=1 to prevent reflection"
+            );
+            return make_truncated_wire(req_msg.id(), Some(query));
         }
 
         let mut wire = entry.raw_wire.clone();
@@ -231,6 +250,17 @@ pub async fn process_dns_wire(
                 "[RESOLVED] Resolution completed"
             );
 
+            if state.rate_limiter.should_challenge_large_response(protocol, client_ip, wire.len()) {
+                tracing::warn!(
+                    protocol,
+                    client = %client_ip,
+                    domain = %qname,
+                    resp_bytes = wire.len(),
+                    "[SECURITY] Large UDP resolved response challenged with TC=1"
+                );
+                return make_truncated_wire(req_msg.id(), Some(query));
+            }
+
             wire
         }
         Err(err) => {
@@ -246,6 +276,18 @@ pub async fn process_dns_wire(
             make_servfail_wire(req_msg.id(), Some(query))
         }
     }
+}
+
+pub fn make_truncated_wire(id: u16, query: Option<&hickory_proto::op::Query>) -> Vec<u8> {
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Response);
+    msg.set_truncated(true);
+    msg.set_recursion_available(true);
+    if let Some(q) = query {
+        msg.add_query(q.clone());
+    }
+    msg.to_bytes().unwrap_or_default()
 }
 
 pub fn make_servfail_wire(id: u16, query: Option<&hickory_proto::op::Query>) -> Vec<u8> {
