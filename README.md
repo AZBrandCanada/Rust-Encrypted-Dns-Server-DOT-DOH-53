@@ -1,7 +1,3 @@
-mkdir -p .
-
-cat << 'EOF' | sed 's/^:::/```/' > README.md
-<!-- README.md -->
 # DNS Server
 
 A high-performance, lightweight, multi-protocol recursive DNS server built in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) simultaneously while performing independent, from-root recursive resolution without relying on upstream third-party resolvers.
@@ -215,4 +211,3 @@ curl -s -H "Accept: application/dns-message" \
 Run an end-to-end verification through `dnscheck.tools`:
 * Open `https://dnscheck.tools/` in a browser configured to use your DoH or DoT endpoint.
 * All checks for **Valid**, **Invalid**, **Expired**, and **Missing** signatures will report **PASS (green)** across ECDSA P-256, P-384, and Ed25519.
-EOF
