@@ -21,15 +21,16 @@ pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String
     if path.exists() {
         if let Ok(domains) = load_from_file(path, limit) {
             if domains.len() >= limit {
-                tracing::info!(path = file_path, count = domains.len(), "[TRANCO] Using local domain list");
+                tracing::info!(path = file_path, count = domains.len(), "[TRANCO] Using local domain list file");
                 return domains;
             }
         }
     }
 
-    tracing::info!(limit, "[TRANCO] Downloading Tranco Top 1M list...");
+    tracing::info!(limit, "[TRANCO] Downloading Tranco Top 1M list archive...");
     match download_and_extract(limit).await {
         Ok(domains) => {
+            tracing::info!(count = domains.len(), "[TRANCO] Extracted domains; saving to disk");
             if let Ok(mut f) = File::create(path) {
                 for d in &domains {
                     let _ = writeln!(f, "{}", d);
@@ -38,7 +39,7 @@ pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String
             domains
         }
         Err(err) => {
-            tracing::warn!(error = %err, "[TRANCO] Download failed; using built-in fallback list");
+            tracing::warn!(error = %err, "[TRANCO] Download failed; using built-in fallback domain list");
             EMBEDDED_FALLBACK.iter().take(limit).map(|s| s.to_string()).collect()
         }
     }

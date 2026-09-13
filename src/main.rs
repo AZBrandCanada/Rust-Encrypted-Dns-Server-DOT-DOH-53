@@ -47,13 +47,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let concurrency: usize = std::env::var("WARM_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
 
     if warm_limit > 0 {
+        tracing::info!(
+            warm_limit,
+            concurrency,
+            "[WARM] Cache pre-warming enabled; starting warmup in 5 seconds"
+        );
         let preloader_cache = cache.clone();
         let preloader_recursor = recursor.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            tracing::info!(warm_limit, "[WARM] Fetching Tranco domain list...");
             let domains = tranco::get_or_download_tranco(TRANCO_FILE, warm_limit).await;
             preload_domains(preloader_cache, preloader_recursor, domains, concurrency).await;
         });
+    } else {
+        tracing::info!(
+            "[WARM] Cache pre-warming is disabled (WARM_LIMIT is 0 or unset). Set WARM_LIMIT=1000 in your environment to enable."
+        );
     }
 
     let persist_cache = cache.clone();
@@ -63,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             let count = persist_cache.len();
             save_cache_to_disk(&persist_cache, CACHE_FILE);
-            tracing::debug!(entries = count, "[PERSIST] Cache synced to disk");
+            tracing::info!(entries = count, "[PERSIST] Cache synced to disk");
         }
     });
 
@@ -72,6 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rate_limiter = ratelimit::RateLimiter::new(rl_capacity, rl_per_sec);
 
     let dnssec_enforce = std::env::var("DNSSEC_ENFORCE").ok().as_deref() == Some("1");
+    if dnssec_enforce {
+        tracing::warn!(
+            "[DNSSEC] Strict enforcement ON: broken DNSSEC chains will return SERVFAIL."
+        );
+    }
 
     {
         let rl_cleanup = rate_limiter.clone();
@@ -80,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 rl_cleanup.cleanup(Duration::from_secs(900));
-                tracing::debug!(tracked_sources = rl_cleanup.tracked_sources(), "[RATELIMIT] Cleanup pass");
+                tracing::debug!(tracked_sources = rl_cleanup.tracked_sources(), "[RATELIMIT] Cleanup pass completed");
             }
         });
     }
@@ -115,8 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if loaded_cert.is_self_signed {
         tracing::warn!(
-            "[STARTUP] Running with a SELF-SIGNED certificate. DoT clients will require \
-             insecure mode or local trust installation until a publicly trusted certificate is provided."
+            "[STARTUP] Running with a SELF-SIGNED certificate. Real clients require a publicly trusted certificate."
         );
     }
 
@@ -224,7 +238,7 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
         return;
     }
 
-    tracing::info!(domains = total_domains, concurrency, "[WARM] Beginning cache pre-warming");
+    tracing::info!(domains = total_domains, concurrency, "[WARM] Beginning cache pre-warming process");
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let warmed_count = Arc::new(AtomicUsize::new(0));
@@ -280,11 +294,11 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
             }
 
             let done = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 250 == 0 || done == total_domains {
+            if done % 50 == 0 || done == total_domains {
                 tracing::info!(
                     progress = format!("{}/{}", done, total_domains),
                     records_cached = warmed_ref.load(Ordering::Relaxed),
-                    "[WARM] Milestone"
+                    "[WARM] Pre-warming progress"
                 );
             }
         });

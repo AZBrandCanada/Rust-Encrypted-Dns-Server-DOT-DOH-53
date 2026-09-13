@@ -28,11 +28,11 @@ pub async fn process_dns_wire(
     client_ip: IpAddr,
 ) -> Vec<u8> {
     if !state.rate_limiter.allow(client_ip) {
-        tracing::debug!(protocol, client_ip = %client_ip, "[RATELIMIT] Dropped query over rate limit");
+        tracing::warn!(protocol, client_ip = %client_ip, "[RATELIMIT] Dropped query exceeding rate limit");
         return Vec::new();
     }
 
-    let _start = Instant::now();
+    let start = Instant::now();
     let mut decoder = BinDecoder::new(req_wire);
     let req_msg = match Message::read(&mut decoder) {
         Ok(m) => m,
@@ -49,12 +49,31 @@ pub async fn process_dns_wire(
     let cache_key = format!("{}:{}:IN:do=0", qname, qtype);
     let now = now_secs();
 
+    tracing::info!(
+        protocol,
+        client = %client_ip,
+        domain = %qname,
+        rtype = %qtype,
+        id = req_msg.id(),
+        "[QUERY] Received DNS query"
+    );
+
     // 1. Cache hit path
     if let Some(entry) = state.cache.get(&cache_key) {
         let age = now.saturating_sub(entry.cached_at);
         let is_stale = age >= entry.min_ttl as u64;
 
         if is_stale {
+            tracing::info!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                age_secs = age,
+                ttl = entry.min_ttl,
+                "[CACHE-STALE] Serving stale cache; revalidating in background"
+            );
+
             let cache_clone = state.cache.clone();
             let recursor_clone = state.recursor.clone();
             let key_clone = cache_key.clone();
@@ -92,6 +111,16 @@ pub async fn process_dns_wire(
                     }
                 }
             });
+        } else {
+            tracing::info!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                latency_us = start.elapsed().as_micros(),
+                ttl = entry.min_ttl,
+                "[CACHE-HIT] In-memory cache hit"
+            );
         }
 
         let mut wire = entry.raw_wire.clone();
@@ -103,11 +132,21 @@ pub async fn process_dns_wire(
     }
 
     // 2. Cache miss path
+    tracing::info!(
+        protocol,
+        client = %client_ip,
+        domain = %qname,
+        rtype = %qtype,
+        "[RECURSE] Cache miss; resolving from root servers"
+    );
+
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
+            let mut dnssec_status = DnssecStatus::Insecure;
+
             if !resp_msg.answers().is_empty() {
                 let all_records: Vec<_> = resp_msg.answers().to_vec();
-                let status = DnssecValidator::validate_answer(
+                dnssec_status = DnssecValidator::validate_answer(
                     &state.recursor,
                     &qname,
                     qtype,
@@ -115,7 +154,7 @@ pub async fn process_dns_wire(
                 )
                 .await;
 
-                match status {
+                match dnssec_status {
                     DnssecStatus::Secure => {
                         resp_msg.set_authentic_data(true);
                     }
@@ -130,7 +169,10 @@ pub async fn process_dns_wire(
 
                         if state.dnssec_enforce || is_test_probe {
                             tracing::warn!(
-                                protocol, domain = %qname, rtype = %qtype,
+                                protocol,
+                                client = %client_ip,
+                                domain = %qname,
+                                rtype = %qtype,
                                 "[DNSSEC] Bogus signature detected; returning SERVFAIL"
                             );
                             return make_servfail_wire(req_msg.id(), Some(query));
@@ -147,6 +189,9 @@ pub async fn process_dns_wire(
                 Err(_) => return make_servfail_wire(req_msg.id(), Some(query)),
             };
 
+            let answers_count = resp_msg.answers().len();
+            let rcode = resp_msg.response_code();
+
             if is_cacheable(&resp_msg) {
                 let ttl = calculate_min_ttl(&resp_msg);
                 state.cache.insert(
@@ -160,9 +205,32 @@ pub async fn process_dns_wire(
                 );
             }
 
+            tracing::info!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                rcode = %rcode,
+                answers = answers_count,
+                dnssec = ?dnssec_status,
+                latency_ms = start.elapsed().as_millis(),
+                "[RESOLVED] Resolution completed"
+            );
+
             wire
         }
-        Err(_) => make_servfail_wire(req_msg.id(), Some(query)),
+        Err(err) => {
+            tracing::error!(
+                protocol,
+                client = %client_ip,
+                domain = %qname,
+                rtype = %qtype,
+                error = %err,
+                latency_ms = start.elapsed().as_millis(),
+                "[ERROR] Recursive resolution failed; returning SERVFAIL"
+            );
+            make_servfail_wire(req_msg.id(), Some(query))
+        }
     }
 }
 
