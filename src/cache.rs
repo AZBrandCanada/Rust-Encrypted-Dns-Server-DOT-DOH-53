@@ -31,14 +31,6 @@ mod base64_bytes {
     }
 }
 
-/// A single cached answer. This is used for *both* positive answers
-/// (NOERROR + records) and negative answers (NXDOMAIN, or NOERROR with
-/// zero records, i.e. "NODATA" — e.g. an AAAA query against an
-/// IPv4-only host). Caching NODATA is what the previous version got
-/// wrong: it only cached NOERROR-with-answers or NXDOMAIN, so every
-/// AAAA lookup against an IPv4-only site (extremely common — every OS
-/// does this on essentially every connection) re-walked the entire
-/// resolution from the root servers, every single time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
     #[serde(with = "base64_bytes")]

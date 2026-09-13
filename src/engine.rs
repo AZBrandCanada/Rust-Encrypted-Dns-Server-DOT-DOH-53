@@ -43,7 +43,13 @@ pub async fn process_dns_wire(
     let qname = query.name().clone();
     let qtype = query.query_type();
 
-    // Universal Anti-Amplification & RRL Check
+    // Determine client's EDNS buffer size limit (RFC 1035: 512 without EDNS; up to 1232 safe MTU with EDNS)
+    let client_max_payload = req_msg
+        .edns()
+        .map(|e| (e.max_payload() as usize).clamp(512, 1232))
+        .unwrap_or(512);
+
+    // Universal Anti-Amplification & RRL Check (Per-IP)
     match state.rate_limiter.check_query(protocol, client_ip, &qname, qtype) {
         RrlAction::Allow => {}
         RrlAction::Truncate => {
@@ -145,14 +151,20 @@ pub async fn process_dns_wire(
             );
         }
 
-        // Strict Amplification Defense: Never allow large packets (> 512 bytes) on plain UDP
-        if state.rate_limiter.should_challenge_large_response(protocol, client_ip, entry.raw_wire.len()) {
+        // Amplification Guard: Challenge if UDP response exceeds client's negotiated buffer
+        if state.rate_limiter.should_challenge_large_response(
+            protocol,
+            client_ip,
+            entry.raw_wire.len(),
+            client_max_payload,
+        ) {
             tracing::warn!(
                 protocol,
                 client = %client_ip,
                 domain = %qname,
                 resp_bytes = entry.raw_wire.len(),
-                "[SECURITY] Large UDP response challenged with TC=1 (zero amplification)"
+                max_allowed = client_max_payload,
+                "[SECURITY] Large UDP response challenged with TC=1"
             );
             return make_truncated_wire(req_msg.id(), Some(query));
         }
@@ -251,12 +263,18 @@ pub async fn process_dns_wire(
                 "[RESOLVED] Resolution completed"
             );
 
-            if state.rate_limiter.should_challenge_large_response(protocol, client_ip, wire.len()) {
+            if state.rate_limiter.should_challenge_large_response(
+                protocol,
+                client_ip,
+                wire.len(),
+                client_max_payload,
+            ) {
                 tracing::warn!(
                     protocol,
                     client = %client_ip,
                     domain = %qname,
                     resp_bytes = wire.len(),
+                    max_allowed = client_max_payload,
                     "[SECURITY] Large UDP resolved response challenged with TC=1"
                 );
                 return make_truncated_wire(req_msg.id(), Some(query));

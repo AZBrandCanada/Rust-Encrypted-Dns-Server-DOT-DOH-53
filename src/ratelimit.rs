@@ -1,7 +1,7 @@
 // src/ratelimit.rs
 use dashmap::DashMap;
 use hickory_proto::rr::{Name, RecordType};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,11 +21,12 @@ struct Bucket {
 
 struct DomainRateBucket {
     count: AtomicI64,
-    last_reset_sec: AtomicI64,
+    last_seen_sec: AtomicI64,
+    penalized_until_sec: AtomicI64,
 }
 
 pub struct RateLimiter {
-    subnet_buckets: DashMap<IpAddr, Bucket>,
+    ip_buckets: DashMap<IpAddr, Bucket>,
     rrl_buckets: DashMap<String, DomainRateBucket>,
     capacity: i64,
     refill_per_sec: i64,
@@ -34,26 +35,15 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(capacity: i64, refill_per_sec: i64) -> Arc<Self> {
         Arc::new(Self {
-            subnet_buckets: DashMap::new(),
+            ip_buckets: DashMap::new(),
             rrl_buckets: DashMap::new(),
             capacity,
             refill_per_sec,
         })
     }
 
-    pub fn to_subnet(ip: IpAddr) -> IpAddr {
-        match ip {
-            IpAddr::V4(v4) => {
-                let oct = v4.octets();
-                IpAddr::V4(Ipv4Addr::new(oct[0], oct[1], oct[2], 0))
-            }
-            IpAddr::V6(v6) => {
-                let seg = v6.segments();
-                IpAddr::V6(Ipv6Addr::new(seg[0], seg[1], seg[2], 0, 0, 0, 0, 0))
-            }
-        }
-    }
-
+    /// Rate limits and RRL checks per individual client IP.
+    /// Incorporates penalty-box dampening so floods cannot leak packets on second boundaries.
     pub fn check_query(
         &self,
         protocol: &str,
@@ -69,16 +59,16 @@ impl RateLimiter {
             return RrlAction::Allow;
         }
 
-        // RFC 8482: Drop all ANY queries over plain UDP immediately
+        // RFC 8482: Drop all ANY queries over plain UDP immediately to eliminate reflection abuse
         if qtype == RecordType::ANY {
             return RrlAction::Drop;
         }
 
-        let subnet = Self::to_subnet(client_ip);
         let now_ms = now_millis();
         let now_s = now_ms / 1000;
 
-        let bucket = self.subnet_buckets.entry(subnet).or_insert_with(|| Bucket {
+        // 1. Token bucket tracked strictly per client IP
+        let bucket = self.ip_buckets.entry(client_ip).or_insert_with(|| Bucket {
             tokens: AtomicI64::new(self.capacity),
             last_refill_millis: AtomicI64::new(now_ms),
             last_seen_millis: AtomicI64::new(now_ms),
@@ -104,64 +94,80 @@ impl RateLimiter {
         }
         bucket.tokens.fetch_sub(1, Ordering::Relaxed);
 
-        let rrl_key = format!("{}:{}:{}", subnet, qname.to_string().to_lowercase(), qtype);
+        // 2. Response Rate Limiting (RRL) per Client IP + Domain + Record Type
+        let rrl_key = format!("{}:{}:{}", client_ip, qname.to_string().to_lowercase(), qtype);
         let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| DomainRateBucket {
             count: AtomicI64::new(0),
-            last_reset_sec: AtomicI64::new(now_s),
+            last_seen_sec: AtomicI64::new(now_s),
+            penalized_until_sec: AtomicI64::new(0),
         });
 
-        let last_reset = domain_entry.last_reset_sec.load(Ordering::Relaxed);
-        if now_s > last_reset {
+        // If currently in penalty cooldown, drop and keep extending the penalty as long as traffic hits
+        let penalty = domain_entry.penalized_until_sec.load(Ordering::Relaxed);
+        if now_s < penalty {
+            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Relaxed);
+            return RrlAction::Drop;
+        }
+
+        let last_seen = domain_entry.last_seen_sec.load(Ordering::Relaxed);
+        if now_s > last_seen {
+            // New 1-second window. Reset query count to 1 and update timestamp
             domain_entry.count.store(1, Ordering::Relaxed);
-            domain_entry.last_reset_sec.store(now_s, Ordering::Relaxed);
+            domain_entry.last_seen_sec.store(now_s, Ordering::Relaxed);
             return RrlAction::Allow;
         }
 
-        let query_rate = domain_entry.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let query_count = domain_entry.count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if query_rate == 1 {
+        if query_count == 1 {
+            // Standard query
             RrlAction::Allow
-        } else if query_rate <= 3 {
-            // Rapid repetition: challenge immediately with TC=1
+        } else if query_count == 2 {
+            // Rapid repetition: challenge with TC=1 so real clients switch to TCP (45 bytes vs 800+ bytes)
             RrlAction::Truncate
         } else {
-            // Flood detected: drop completely
+            // Active flood detected: place in 3-second lockout penalty
+            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Relaxed);
             RrlAction::Drop
         }
     }
 
-    /// Zero-Tolerance Amplification Guard:
-    /// Any UDP response over 512 bytes is challenged with TC=1 (45 bytes) to guarantee ZERO amplification.
+    /// DNS Amplification Guard:
+    /// Checks if a UDP response exceeds the client's supported buffer size.
     pub fn should_challenge_large_response(
         &self,
         protocol: &str,
         client_ip: IpAddr,
         resp_bytes: usize,
+        client_max_payload: usize,
     ) -> bool {
         if protocol != "UDP" || client_ip.is_loopback() {
             return false;
         }
 
-        // Strict limit: never send > 512 bytes over plain unauthenticated UDP
-        resp_bytes > 512
+        resp_bytes > client_max_payload
     }
 
     pub fn cleanup(&self, max_age: Duration) {
         let cutoff_ms = now_millis() - max_age.as_millis() as i64;
         let cutoff_s = cutoff_ms / 1000;
 
-        self.subnet_buckets
+        self.ip_buckets
             .retain(|_, b| b.last_seen_millis.load(Ordering::Relaxed) >= cutoff_ms);
         self.rrl_buckets
-            .retain(|_, b| b.last_reset_sec.load(Ordering::Relaxed) >= cutoff_s);
+            .retain(|_, b| b.last_seen_sec.load(Ordering::Relaxed) >= cutoff_s);
+    }
+
+    pub fn tracked_ips(&self) -> usize {
+        self.ip_buckets.len()
     }
 
     pub fn tracked_subnets(&self) -> usize {
-        self.subnet_buckets.len()
+        self.tracked_ips()
     }
 
     pub fn tracked_sources(&self) -> usize {
-        self.tracked_subnets()
+        self.tracked_ips()
     }
 }
 
