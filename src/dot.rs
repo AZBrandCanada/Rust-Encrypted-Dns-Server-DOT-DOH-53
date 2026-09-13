@@ -7,7 +7,7 @@ use tokio_rustls::TlsAcceptor;
 pub async fn run_dot_listener(listener: TcpListener, acceptor: TlsAcceptor, state: AppState) {
     loop {
         match listener.accept().await {
-            Ok((stream, _peer)) => {
+            Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 let acceptor_ref = acceptor.clone();
                 let state_ref = state.clone();
@@ -15,7 +15,7 @@ pub async fn run_dot_listener(listener: TcpListener, acceptor: TlsAcceptor, stat
                 tokio::spawn(async move {
                     match acceptor_ref.accept(stream).await {
                         Ok(tls_stream) => {
-                            handle_length_prefixed_stream(tls_stream, state_ref, "DoT").await;
+                            handle_length_prefixed_stream(tls_stream, state_ref, "DoT", peer.ip()).await;
                         }
                         Err(e) => {
                             tracing::debug!(error = %e, "[DoT] TLS handshake failed");

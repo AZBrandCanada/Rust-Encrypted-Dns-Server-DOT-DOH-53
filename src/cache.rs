@@ -1,5 +1,4 @@
 // src/cache.rs
-use base64::Engine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

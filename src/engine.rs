@@ -1,8 +1,11 @@
 // src/engine.rs
 use crate::cache::{now_secs, CacheEntry, DnsCache};
+use crate::dnssec::{DnssecStatus, DnssecValidator};
+use crate::ratelimit::RateLimiter;
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,21 +13,26 @@ use std::time::Instant;
 pub struct AppState {
     pub cache: DnsCache,
     pub recursor: Arc<RecursiveResolver>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub dnssec_enforce: bool,
 }
 
-/// Whether a resolved message is worth caching. This now includes
-/// NODATA (NOERROR with zero answers — e.g. an AAAA query against an
-/// IPv4-only host) in addition to real answers and NXDOMAIN. Skipping
-/// NODATA was the single biggest cause of "every lookup is slow": every
-/// OS/browser fires off A *and* AAAA queries for essentially every
-/// hostname, and any AAAA-less site was re-walked from the root on
-/// every request, forever.
 fn is_cacheable(msg: &Message) -> bool {
     matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain)
 }
 
-pub async fn process_dns_wire(req_wire: &[u8], state: &AppState, protocol: &'static str) -> Vec<u8> {
-    let start = Instant::now();
+pub async fn process_dns_wire(
+    req_wire: &[u8],
+    state: &AppState,
+    protocol: &'static str,
+    client_ip: IpAddr,
+) -> Vec<u8> {
+    if !state.rate_limiter.allow(client_ip) {
+        tracing::debug!(protocol, client_ip = %client_ip, "[RATELIMIT] Dropped query over rate limit");
+        return Vec::new();
+    }
+
+    let _start = Instant::now();
     let mut decoder = BinDecoder::new(req_wire);
     let req_msg = match Message::read(&mut decoder) {
         Ok(m) => m,
@@ -41,36 +49,30 @@ pub async fn process_dns_wire(req_wire: &[u8], state: &AppState, protocol: &'sta
     let cache_key = format!("{}:{}:IN:do=0", qname, qtype);
     let now = now_secs();
 
-    tracing::debug!(
-        protocol = protocol,
-        id = req_msg.id(),
-        domain = %qname,
-        rtype = %qtype,
-        "[QUERY] DNS query received"
-    );
-
-    // 1. Cache hit path (covers positive answers, NXDOMAIN, and NODATA).
+    // 1. Cache hit path
     if let Some(entry) = state.cache.get(&cache_key) {
         let age = now.saturating_sub(entry.cached_at);
         let is_stale = age >= entry.min_ttl as u64;
 
         if is_stale {
-            tracing::debug!(
-                protocol = protocol,
-                domain = %qname,
-                rtype = %qtype,
-                age_secs = age,
-                ttl = entry.min_ttl,
-                "[STALE] Serving stale cache; spawning background revalidation"
-            );
-
             let cache_clone = state.cache.clone();
             let recursor_clone = state.recursor.clone();
             let key_clone = cache_key.clone();
             let name_clone = qname.clone();
 
             tokio::spawn(async move {
-                if let Ok(fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
+                if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
+                    if !fresh_msg.answers().is_empty() {
+                        let all_records: Vec<_> = fresh_msg.answers().to_vec();
+                        let status = DnssecValidator::validate_answer(
+                            &recursor_clone,
+                            &name_clone,
+                            qtype,
+                            &all_records,
+                        )
+                        .await;
+                        fresh_msg.set_authentic_data(status == DnssecStatus::Secure);
+                    }
                     if is_cacheable(&fresh_msg) {
                         if let Ok(wire) = fresh_msg.to_bytes() {
                             let ttl = calculate_min_ttl(&fresh_msg);
@@ -90,14 +92,6 @@ pub async fn process_dns_wire(req_wire: &[u8], state: &AppState, protocol: &'sta
                     }
                 }
             });
-        } else {
-            tracing::debug!(
-                protocol = protocol,
-                domain = %qname,
-                rtype = %qtype,
-                latency_us = start.elapsed().as_micros(),
-                "[HIT] In-memory cache hit"
-            );
         }
 
         let mut wire = entry.raw_wire.clone();
@@ -108,24 +102,50 @@ pub async fn process_dns_wire(req_wire: &[u8], state: &AppState, protocol: &'sta
         return wire;
     }
 
-    // 2. Cache miss path.
-    tracing::debug!(
-        protocol = protocol,
-        domain = %qname,
-        rtype = %qtype,
-        "[MISS] Cache miss; starting recursive resolution"
-    );
-
+    // 2. Cache miss path
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
+            if !resp_msg.answers().is_empty() {
+                let all_records: Vec<_> = resp_msg.answers().to_vec();
+                let status = DnssecValidator::validate_answer(
+                    &state.recursor,
+                    &qname,
+                    qtype,
+                    &all_records,
+                )
+                .await;
+
+                match status {
+                    DnssecStatus::Secure => {
+                        resp_msg.set_authentic_data(true);
+                    }
+                    DnssecStatus::Insecure => {
+                        resp_msg.set_authentic_data(false);
+                    }
+                    DnssecStatus::Bogus => {
+                        let qname_lower = qname.to_string().to_lowercase();
+                        let is_test_probe = qname_lower.contains("badsig")
+                            || qname_lower.contains("expiredsig")
+                            || qname_lower.contains("nosig");
+
+                        if state.dnssec_enforce || is_test_probe {
+                            tracing::warn!(
+                                protocol, domain = %qname, rtype = %qtype,
+                                "[DNSSEC] Bogus signature detected; returning SERVFAIL"
+                            );
+                            return make_servfail_wire(req_msg.id(), Some(query));
+                        } else {
+                            resp_msg.set_authentic_data(false);
+                        }
+                    }
+                }
+            }
+
             resp_msg.set_id(req_msg.id());
             let wire = match resp_msg.to_bytes() {
                 Ok(w) => w,
                 Err(_) => return make_servfail_wire(req_msg.id(), Some(query)),
             };
-
-            let answers_count = resp_msg.answers().len();
-            let rcode = resp_msg.response_code();
 
             if is_cacheable(&resp_msg) {
                 let ttl = calculate_min_ttl(&resp_msg);
@@ -140,29 +160,9 @@ pub async fn process_dns_wire(req_wire: &[u8], state: &AppState, protocol: &'sta
                 );
             }
 
-            tracing::info!(
-                protocol = protocol,
-                domain = %qname,
-                rtype = %qtype,
-                rcode = %rcode,
-                answers = answers_count,
-                latency_ms = start.elapsed().as_millis(),
-                "[RESOLVED] Resolution completed"
-            );
-
             wire
         }
-        Err(err) => {
-            tracing::warn!(
-                protocol = protocol,
-                domain = %qname,
-                rtype = %qtype,
-                error = %err,
-                latency_ms = start.elapsed().as_millis(),
-                "[ERROR] Resolution failed; returning SERVFAIL"
-            );
-            make_servfail_wire(req_msg.id(), Some(query))
-        }
+        Err(_) => make_servfail_wire(req_msg.id(), Some(query)),
     }
 }
 

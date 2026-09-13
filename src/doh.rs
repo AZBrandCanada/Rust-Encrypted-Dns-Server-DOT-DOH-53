@@ -2,7 +2,7 @@
 use crate::engine::{process_dns_wire, AppState};
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::prelude::*;
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 #[derive(Deserialize)]
 pub struct DohQuery {
@@ -23,7 +24,11 @@ pub fn build_doh_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn handle_doh_get(State(state): State<AppState>, Query(params): Query<DohQuery>) -> Response {
+async fn handle_doh_get(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<DohQuery>,
+) -> Response {
     let encoded = match params.dns {
         Some(d) => d,
         None => return (StatusCode::BAD_REQUEST, "Missing dns parameter").into_response(),
@@ -34,15 +39,19 @@ async fn handle_doh_get(State(state): State<AppState>, Query(params): Query<DohQ
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response(),
     };
 
-    let resp_wire = process_dns_wire(&raw_bytes, &state, "DoH").await;
+    let resp_wire = process_dns_wire(&raw_bytes, &state, "DoH", peer.ip()).await;
     make_dns_response(resp_wire)
 }
 
-async fn handle_doh_post(State(state): State<AppState>, body: Bytes) -> Response {
+async fn handle_doh_post(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty body").into_response();
     }
-    let resp_wire = process_dns_wire(&body, &state, "DoH").await;
+    let resp_wire = process_dns_wire(&body, &state, "DoH", peer.ip()).await;
     make_dns_response(resp_wire)
 }
 

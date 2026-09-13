@@ -1,9 +1,11 @@
 // src/main.rs
 mod cache;
 mod dns;
+mod dnssec;
 mod doh;
 mod dot;
 mod engine;
+mod ratelimit;
 mod recursor;
 mod tls;
 mod tranco;
@@ -41,13 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     load_cache_from_disk(&cache, CACHE_FILE);
 
-    // Cache pre-warming is OFF by default now. The old default (10,000
-    // domains, concurrency 32) fired the moment the process started and
-    // fought live client queries for sockets/CPU using the exact same
-    // slow, uncached recursion path everything else used — a self-
-    // inflicted DDoS on your own resolver at the worst possible moment
-    // (right after (re)start). Turn it on deliberately once the server
-    // has been stable for a while, with a much lower concurrency.
     let warm_limit: usize = std::env::var("WARM_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let concurrency: usize = std::env::var("WARM_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
 
@@ -55,8 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let preloader_cache = cache.clone();
         let preloader_recursor = recursor.clone();
         tokio::spawn(async move {
-            // Give the server a minute of quiet time to handle real
-            // traffic before starting the (slow, first-touch) warm pass.
             tokio::time::sleep(Duration::from_secs(60)).await;
             let domains = tranco::get_or_download_tranco(TRANCO_FILE, warm_limit).await;
             preload_domains(preloader_cache, preloader_recursor, domains, concurrency).await;
@@ -74,14 +67,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app_state = AppState { cache: cache.clone(), recursor: recursor.clone() };
+    let rl_capacity: i64 = std::env::var("RATE_LIMIT_BURST").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let rl_per_sec: i64 = std::env::var("RATE_LIMIT_PER_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let rate_limiter = ratelimit::RateLimiter::new(rl_capacity, rl_per_sec);
+
+    let dnssec_enforce = std::env::var("DNSSEC_ENFORCE").ok().as_deref() == Some("1");
+
+    {
+        let rl_cleanup = rate_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                rl_cleanup.cleanup(Duration::from_secs(900));
+                tracing::debug!(tracked_sources = rl_cleanup.tracked_sources(), "[RATELIMIT] Cleanup pass");
+            }
+        });
+    }
+
+    let app_state = AppState {
+        cache: cache.clone(),
+        recursor: recursor.clone(),
+        rate_limiter,
+        dnssec_enforce,
+    };
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let requested_dns_port: u16 = std::env::var("DNS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(53);
     let requested_dot_port: u16 = std::env::var("DOT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(853);
     let requested_doh_port: u16 = std::env::var("DOH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
+    let doh_no_tls = std::env::var("DOH_NO_TLS").ok().as_deref() == Some("1");
 
-    // --- Plain DNS: UDP + TCP on port 53 ---
+    // --- Plain DNS: UDP + TCP on port 53 (fallback: 5053) ---
     let (udp_socket, active_dns_port) = bind_udp(&host, requested_dns_port, 5053).await?;
     let udp_socket = Arc::new(udp_socket);
     let udp_state = app_state.clone();
@@ -91,55 +108,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_state = app_state.clone();
     tokio::spawn(async move { dns::run_tcp_listener(tcp_listener, tcp_state).await; });
 
-    // --- Real TLS certificate, shared by DoT and DoH ---
+    // --- TLS Certificate (Shared by DoT and optionally DoH) ---
     let cert_path = std::env::var("CERT_PATH").unwrap_or_else(|_| "fullchain.pem".to_string());
     let key_path = std::env::var("KEY_PATH").unwrap_or_else(|_| "privkey.pem".to_string());
     let loaded_cert = tls::load_or_generate(&cert_path, &key_path)?;
 
     if loaded_cert.is_self_signed {
         tracing::warn!(
-            "[STARTUP] Running with a SELF-SIGNED certificate. DoT (Android Private DNS) and \
-             DoH will NOT validate for real clients until you install a real certificate — see README.md."
+            "[STARTUP] Running with a SELF-SIGNED certificate. DoT clients will require \
+             insecure mode or local trust installation until a publicly trusted certificate is provided."
         );
     }
 
-    // --- DoT: DNS-over-TLS on port 853 ---
+    // --- DoT: Port 853 (fallback: 8853) ---
     let dot_tls_config = tls::dot_server_config(&loaded_cert)?;
     let dot_acceptor = TlsAcceptor::from(dot_tls_config);
     let (dot_listener, active_dot_port) = bind_tcp(&host, requested_dot_port, 8853).await?;
     let dot_state = app_state.clone();
     tokio::spawn(async move { dot::run_dot_listener(dot_listener, dot_acceptor, dot_state).await; });
 
-    // --- DoH: HTTPS on port 443 (real TLS via axum-server) ---
-    let doh_tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        loaded_cert.cert_file.clone(),
-        loaded_cert.key_file.clone(),
-    )
-    .await?;
+    // --- DoH: Port 443 (or custom DOH_PORT, fallback: 8443) ---
+    let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
+    drop(doh_test_sock);
+
     let doh_router = doh::build_doh_router(app_state.clone());
-    let doh_addr: std::net::SocketAddr = format!("{}:{}", host, requested_doh_port).parse()?;
-
-    tracing::info!(
-        dns_port = active_dns_port,
-        dot_port = active_dot_port,
-        doh_port = requested_doh_port,
-        "[SERVER] All listeners active: plain DNS (UDP/TCP), DoT, DoH"
-    );
-
+    let doh_addr: std::net::SocketAddr = format!("{}:{}", host, active_doh_port).parse()?;
     let doh_handle = axum_server::Handle::new();
     let doh_handle_for_serve = doh_handle.clone();
-    let serve_task = tokio::spawn(async move {
-        if let Err(e) = axum_server::bind_rustls(doh_addr, doh_tls_config)
-            .handle(doh_handle_for_serve)
-            .serve(doh_router.into_make_service())
+
+    if doh_no_tls {
+        tracing::info!(
+            dns_port = active_dns_port,
+            dot_port = active_dot_port,
+            doh_port = active_doh_port,
+            doh_mode = "plain HTTP (reverse proxy mode)",
+            "[SERVER] All listeners active"
+        );
+        let listener = tokio::net::TcpListener::bind(doh_addr).await?;
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                doh_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
             .await
-        {
-            tracing::error!(error = %e, "[SERVER] DoH listener failed");
-        }
-    });
+            {
+                tracing::error!(error = %e, "[SERVER] DoH HTTP listener failed");
+            }
+        });
+    } else {
+        tracing::info!(
+            dns_port = active_dns_port,
+            dot_port = active_dot_port,
+            doh_port = active_doh_port,
+            doh_mode = "HTTPS (TLS)",
+            "[SERVER] All listeners active"
+        );
+        let doh_tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            loaded_cert.cert_file.clone(),
+            loaded_cert.key_file.clone(),
+        )
+        .await?;
+
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(doh_addr, doh_tls_config)
+                .handle(doh_handle_for_serve)
+                .serve(doh_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+            {
+                tracing::error!(error = %e, "[SERVER] DoH HTTPS listener failed");
+            }
+        });
+    }
 
     tokio::select! {
-        _ = serve_task => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("[SERVER] Shutdown requested. Saving cache...");
             doh_handle.shutdown();
@@ -211,8 +252,19 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
                     if cache_ref.contains_key(&cache_key) {
                         continue;
                     }
-                    if let Ok(msg) = recursor_ref.resolve(&name, qtype).await {
+                    if let Ok(mut msg) = recursor_ref.resolve(&name, qtype).await {
                         if matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain) {
+                            if !msg.answers().is_empty() {
+                                let all_records: Vec<_> = msg.answers().to_vec();
+                                let status = dnssec::DnssecValidator::validate_answer(
+                                    &recursor_ref,
+                                    &name,
+                                    qtype,
+                                    &all_records,
+                                )
+                                .await;
+                                msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
+                            }
                             if let Ok(wire) = msg.to_bytes() {
                                 let ttl = calculate_min_ttl(&msg);
                                 let now = now_secs();

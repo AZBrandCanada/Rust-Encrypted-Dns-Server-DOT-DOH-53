@@ -1,35 +1,4 @@
 // src/recursor.rs
-//
-// Core fixes vs. the previous version:
-//
-//   1. Delegation caching. The old resolver walked from the 13 root
-//      servers on *every single query*, with no memory of "the .com TLD
-//      servers are X/Y/Z" or "example.com's nameservers are A/B/C".
-//      That meant every lookup paid the full root -> TLD -> authoritative
-//      latency, every time, for every client. Here, every delegation we
-//      learn along the way gets cached (keyed by zone, with the zone's own
-//      TTL), and a new query starts from the deepest cached zone it can
-//      find instead of always starting at the root.
-//
-//   2. Parallel nameserver racing. The old code tried nameservers one at
-//      a time, waiting out a full timeout on each before trying the next.
-//      A single slow/unreachable nameserver could add seconds of latency
-//      per hop. Here we race several nameservers concurrently per hop and
-//      take whichever answers first.
-//
-//   3. IPv4 *and* IPv6 glue. The old code only ever collected `A` glue
-//      records from referrals, so referrals that only carried `AAAA`
-//      glue (increasingly common) failed outright.
-//
-//   4. A real loop guard. Instead of only a numeric depth counter (which
-//      still lets a misconfigured zone burn through the entire step
-//      budget doing nothing), we track visited zones/names and bail out
-//      immediately if a referral makes no forward progress.
-//
-// Negative caching (NODATA / NXDOMAIN) is *not* handled here — it's
-// handled in engine.rs, which decides what's cache-worthy. This module
-// only answers queries and reports what TTL a given answer carries.
-
 use dashmap::DashMap;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
@@ -40,6 +9,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -71,8 +41,8 @@ const TCP_TIMEOUT: Duration = Duration::from_millis(2000);
 const MAX_PARALLEL_SERVERS: usize = 4;
 const MAX_DEPTH: usize = 16;
 const MAX_STEPS: usize = 16;
-const MIN_DELEGATION_TTL: u64 = 300; // 5 min floor: don't re-walk pointlessly often
-const MAX_DELEGATION_TTL: u64 = 172_800; // 2 day ceiling: don't trust glue forever
+const MIN_DELEGATION_TTL: u64 = 300;
+const MAX_DELEGATION_TTL: u64 = 172_800;
 
 #[derive(Debug, Error)]
 pub enum RecursorError {
@@ -89,7 +59,7 @@ pub enum RecursorError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("DNS Protocol error: {0}")]
-    Proto(#[from] hickory_proto::error::ProtoError),
+    Proto(#[from] hickory_proto::ProtoError),
     #[error("DNS Decode error: {0}")]
     Decode(#[from] hickory_proto::serialize::binary::DecodeError),
 }
@@ -130,11 +100,13 @@ impl RecursiveResolver {
             let start_ips = self
                 .find_cached_start(name)
                 .unwrap_or_else(|| ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect());
+
             let mut current_servers: Vec<SocketAddr> =
                 start_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
             current_servers.shuffle(&mut rand::thread_rng());
 
             let mut last_zone: Option<String> = None;
+            let mut bailiwick: Name = Name::root();
 
             for _step in 0..MAX_STEPS {
                 let response = match Self::query_servers_parallel(&current_servers, name, rtype).await {
@@ -142,14 +114,13 @@ impl RecursiveResolver {
                     None => return Err(RecursorError::AllNameserversFailed),
                 };
 
-                // Case 1: direct answers or a CNAME to chase.
                 if !response.answers().is_empty() {
                     let has_target_type = response
                         .answers()
                         .iter()
                         .any(|r| r.record_type() == rtype);
                     let cname_target = response.answers().iter().find_map(|r| {
-                        if let Some(RData::CNAME(cname)) = r.data() {
+                        if let RData::CNAME(cname) = r.data() {
                             Some(cname.0.clone())
                         } else {
                             None
@@ -161,7 +132,6 @@ impl RecursiveResolver {
                     } else if let Some(target) = cname_target {
                         let key = format!("cname:{}", target.to_string().to_lowercase());
                         if visited.contains(&key) {
-                            // CNAME loop — just return what we have.
                             return Ok(response);
                         }
                         visited.insert(key);
@@ -181,14 +151,10 @@ impl RecursiveResolver {
                     }
                 }
 
-                // Case 2: authoritative NXDOMAIN.
                 if response.response_code() == ResponseCode::NXDomain {
                     return Ok(response);
                 }
 
-                // Case 3: no delegation offered at all -> this is the
-                // authoritative NODATA answer. Return it as-is; the
-                // caller (engine.rs) decides whether/how to cache it.
                 if response.name_servers().is_empty() {
                     return Ok(response);
                 }
@@ -197,7 +163,7 @@ impl RecursiveResolver {
                     .name_servers()
                     .iter()
                     .filter_map(|r| {
-                        if let Some(RData::NS(ns)) = r.data() {
+                        if let RData::NS(ns) = r.data() {
                             Some(ns.0.clone())
                         } else {
                             None
@@ -206,8 +172,6 @@ impl RecursiveResolver {
                     .collect();
 
                 if ns_names.is_empty() {
-                    // Authority section had records but none were NS —
-                    // nothing more we can do with this response.
                     return Ok(response);
                 }
 
@@ -220,21 +184,21 @@ impl RecursiveResolver {
                     return Err(RecursorError::NoProgress);
                 }
 
-                // Collect glue: both A and AAAA.
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
                         continue;
                     }
+                    if !is_in_bailiwick(add.name(), &bailiwick) {
+                        continue;
+                    }
                     match add.data() {
-                        Some(RData::A(a)) => next_ips.push(IpAddr::V4(a.0)),
-                        Some(RData::AAAA(a)) => next_ips.push(IpAddr::V6(a.0)),
+                        RData::A(a) => next_ips.push(IpAddr::V4(a.0)),
+                        RData::AAAA(a) => next_ips.push(IpAddr::V6(a.0)),
                         _ => {}
                     }
                 }
 
-                // Glueless referral: resolve one of the NS names' own A
-                // record out of band.
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key = format!("ns:{}", ns_name.to_string().to_lowercase());
@@ -248,7 +212,7 @@ impl RecursiveResolver {
                             .await
                         {
                             for ans in ns_resp.answers() {
-                                if let Some(RData::A(a)) = ans.data() {
+                                if let RData::A(a) = ans.data() {
                                     next_ips.push(IpAddr::V4(a.0));
                                 }
                             }
@@ -274,6 +238,11 @@ impl RecursiveResolver {
                     );
                 }
 
+                if let Some(zone) = &zone_name {
+                    if let Ok(zone_as_name) = Name::from_str(zone) {
+                        bailiwick = zone_as_name;
+                    }
+                }
                 last_zone = zone_name;
                 next_ips.shuffle(&mut rand::thread_rng());
                 current_servers = next_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
@@ -283,8 +252,6 @@ impl RecursiveResolver {
         })
     }
 
-    /// Walk up from `name` through its ancestor zones looking for a
-    /// cached, unexpired delegation to start from instead of the root.
     fn find_cached_start(&self, name: &Name) -> Option<Vec<IpAddr>> {
         let now = now_secs();
         let mut current = name.clone();
@@ -303,8 +270,6 @@ impl RecursiveResolver {
         None
     }
 
-    /// Race up to MAX_PARALLEL_SERVERS nameservers concurrently and
-    /// return the first usable (non-REFUSED, non-SERVFAIL) response.
     async fn query_servers_parallel(
         servers: &[SocketAddr],
         name: &Name,
@@ -338,19 +303,23 @@ impl RecursiveResolver {
         name: &Name,
         rtype: RecordType,
     ) -> Result<Message, RecursorError> {
-        let mut query_msg = Message::new();
         let txid: u16 = rand::thread_rng().gen();
+        let sent_name_str = randomize_case(&name.to_ascii());
+        let sent_name = Name::from_str(&sent_name_str).unwrap_or_else(|_| name.clone());
+
+        let mut query_msg = Message::new();
         query_msg.set_id(txid);
         query_msg.set_message_type(MessageType::Query);
         query_msg.set_op_code(OpCode::Query);
-        query_msg.set_recursion_desired(false); // we ARE the recursor; ask iteratively
+        query_msg.set_recursion_desired(false);
 
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
+        edns.set_dnssec_ok(true);
         query_msg.set_edns(edns);
 
         let mut query = Query::new();
-        query.set_name(name.clone());
+        query.set_name(sent_name.clone());
         query.set_query_type(rtype);
         query.set_query_class(DNSClass::IN);
         query_msg.add_query(query);
@@ -369,6 +338,10 @@ impl RecursiveResolver {
         let mut decoder = BinDecoder::new(&buf[..n]);
         let response = Message::read(&mut decoder)?;
 
+        if !response_matches(&response, txid, &sent_name, rtype) {
+            return Err(RecursorError::AllNameserversFailed);
+        }
+
         if response.truncated() {
             let mut stream = timeout(TCP_TIMEOUT, TcpStream::connect(addr))
                 .await
@@ -386,6 +359,10 @@ impl RecursiveResolver {
 
             let mut tcp_decoder = BinDecoder::new(&tcp_buf);
             let tcp_response = Message::read(&mut tcp_decoder)?;
+
+            if !response_matches(&tcp_response, txid, &sent_name, rtype) {
+                return Err(RecursorError::AllNameserversFailed);
+            }
             return Ok(tcp_response);
         }
 
@@ -393,7 +370,46 @@ impl RecursiveResolver {
     }
 }
 
-/// TTL to use for the final answer we hand back to the client.
+fn randomize_case(name: &str) -> String {
+    let mut rng = rand::thread_rng();
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() && rng.gen_bool(0.5) {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn response_matches(response: &Message, txid: u16, sent_name: &Name, rtype: RecordType) -> bool {
+    if response.id() != txid {
+        return false;
+    }
+    if response.message_type() != MessageType::Response {
+        return false;
+    }
+    let Some(q) = response.queries().first() else { return false };
+    if q.query_type() != rtype || q.query_class() != DNSClass::IN {
+        return false;
+    }
+    q.name() == sent_name
+}
+
+fn is_in_bailiwick(name: &Name, zone: &Name) -> bool {
+    if zone.is_root() {
+        return true;
+    }
+    let name_s = name.to_string().to_lowercase();
+    let zone_s = zone.to_string().to_lowercase();
+    name_s == zone_s || name_s.ends_with(&format!(".{}", zone_s))
+}
+
 pub fn calculate_min_ttl(msg: &Message) -> u32 {
     let mut min_ttl = u32::MAX;
     for r in msg.answers() {
@@ -412,8 +428,6 @@ pub fn calculate_min_ttl(msg: &Message) -> u32 {
     }
 }
 
-/// TTL to use for how long *we* trust a delegation (NS + glue) before
-/// re-fetching it from the parent zone.
 fn delegation_ttl(msg: &Message) -> u64 {
     let mut min_ttl = u32::MAX;
     for r in msg.name_servers() {

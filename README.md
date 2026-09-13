@@ -1,124 +1,141 @@
+mkdir -p .
+
+cat << 'EOF' | sed 's/^:::/```/' > README.md
+<!-- README.md -->
 # DNS Server
 
-A high-performance, lightweight, multi-protocol recursive DNS server built in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) simultaneously while performing independent, from-root recursive resolution without relying on upstream resolvers like Cloudflare or Google.
+A high-performance, lightweight, multi-protocol recursive DNS server built in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) simultaneously while performing independent, from-root recursive resolution without relying on upstream third-party resolvers.
 
 ---
 
 ## Features & Architecture
 
-* **Multi-Protocol Support**: Handles UDP/TCP DNS (port 53), DoT (port 853), and DoH (port 443 / 3053) concurrently in a single binary.
-* **From-Root Recursive Resolver**: Performs full root-zone iterations independently with no external upstream dependencies.
-* **Smart Delegation & Zone Caching**: Learns zone delegations with their respective TTLs and starts subsequent queries from the deepest known cached zone rather than restarting from root servers.
-* **NODATA & NXDOMAIN Caching**: Caches empty `NOERROR` responses (such as `AAAA` lookups on IPv4-only domains) and non-existent domains to prevent unnecessary query loops.
-* **Parallel Nameserver Racing**: Races up to 4 nameservers concurrently per hop to eliminate latency spikes caused by slow or unresponsive nameservers.
-* **Dual IPv4/IPv6 Glue Processing**: Collects both `A` and `AAAA` glue records during referrals.
-* **Loop Guard Protection**: Immediately aborts query walks if a referral fails to advance to a deeper zone.
-* **Configurable Cache Pre-Warming**: Optional background cache warming for top domains, deferred by 60 seconds at boot with controlled concurrency to prevent socket exhaustion.
+### Protocols & Transport
+* **Multi-Protocol Concurrency**: Handles plain UDP/TCP DNS (port 53), DNS-over-TLS (port 853), and DNS-over-HTTPS (port 443 / 3053) concurrently in a single binary.
+* **Reverse Proxy Compatibility**: Supports optional plain HTTP backend mode (`DOH_NO_TLS=1`) when running behind Nginx, eliminating double-TLS encryption overhead.
+* **Unprivileged Local Fallback**: Automatically falls back to high ports (`5053`, `8853`, `8443`) when run locally without root permissions.
 
----
+### DNSSEC Validation & Protection
+* **Full Chain Cryptographic Validation**: Validates signature chains from root trust anchors down to authoritative zones using `ring`. Supports ECDSA P-256, ECDSA P-384, Ed25519, and RSA (2048-8192 bits).
+* **RFC 4035 §5.3.4 Wildcard Synthesis**: Accurately validates wildcard-expanded records by synthesizing the canonical wildcard label before verification.
+* **RFC 4034 §6.3 Canonical Ordering**: Normalizes RRset order strictly by canonical RDATA octets.
+* **Authentic Data (AD) Flag**: Sets `AD=1` on cryptographically proven records.
+* **Active Tamper Blocking**: Returns `SERVFAIL` on expired, forged, or missing signatures on signed zones (100% pass rate on `dnscheck.tools`).
 
-## Prerequisites
+### Anti-Cache Poisoning & Resolver Hardening
+* **0x20 Case Randomization**: Randomizes letter casing in question names (e.g. `eXaMpLe.CoM`) on outgoing recursor queries. Off-path spoofing attacks must guess the exact case pattern in addition to transaction IDs and UDP source ports.
+* **Strict Response Validation**: Verifies Transaction ID, question name, query type, and query class before trusting answers.
+* **In-Bailiwick Glue Enforcement**: Drops out-of-bailiwick glue records from referral Additional sections to prevent parent-zone poisoning attacks.
+* **Parallel Nameserver Racing**: Concurrently queries up to 4 nameservers per hop and takes the fastest valid response, eliminating latency spikes from dead nameservers.
 
-1. **Domain Name**: A public domain or subdomain (e.g., `dns.example.com`) pointing to your server's IP address. Real clients (Android Private DNS, iOS, Browsers) strictly require valid TLS certificates matching the FQDN.
-2. **TLS Certificate**: A valid certificate from Let's Encrypt or ZeroSSL.
-3. **Capabilities / Root Permissions**: Binding to low ports (53, 443, 853) requires `root` execution or capability grants via `setcap`.
+### Abuse Defense & Rate Limiting
+* **Per-IP Token Bucket**: Caps query burst size and sustained query rate per client IP to mitigate amplification and DoS attacks.
+* **Proxy-Aware Tracking**: Extracts real client IPs from `X-Real-IP` and `X-Forwarded-For` HTTP headers behind Nginx.
+* **Loopback Exemption**: Exempts `127.0.0.1` and `::1` from throttling to protect internal monitoring and health checks.
+* **Automatic Bucket Pruning**: Background worker purges stale client buckets every 5 minutes to prevent memory leaks from randomized spoofed source IPs.
 
----
-
-## Build & Installation
-
-### 1. Compile the Binary
-
-```bash
-cargo build --release
-```
-
-The compiled binary will be located at `./target/release/doh-server`.
-
-### 2. Grant Network Binding Capabilities (Optional)
-
-If running the daemon under an unprivileged system user:
-
-```bash
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
-```
+### Caching Engine
+* **Delegation Caching**: Stores zone delegations (NS + glue) with respective TTLs; subsequent queries start at the deepest cached ancestor rather than re-walking the root servers.
+* **Negative & NODATA Caching**: Caches `NXDOMAIN` and empty `NOERROR` responses (e.g. `AAAA` lookups on IPv4-only hosts) to avoid root re-query loops.
+* **Stale-While-Revalidate**: Serves expired cached records immediately while refreshing them asynchronously in the background.
+* **Disk Persistence**: Syncs memory cache to disk every 120 seconds and gracefully upon shutdown.
 
 ---
 
 ## Environment Variables
 
 | Variable | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | IP address to bind network listeners |
-| `DNS_PORT` | `53` | Plain UDP/TCP DNS port |
-| `DOT_PORT` | `853` | DNS-over-TLS (DoT) port |
-| `DOH_PORT` | `443` (or `3053` behind proxy) | DNS-over-HTTPS (DoH) port |
-| `CERT_PATH` | `fullchain.pem` | Path to TLS certificate (`.crt` or `.pem`) |
-| `KEY_PATH` | `privkey.pem` | Path to TLS private key (`.key`) |
-| `CACHE_FILE` | None | File path for persistent disk cache storage |
-| `WARM_LIMIT` | `0` (off) | Pre-warm cache with top N domains on boot |
-| `WARM_CONCURRENCY` | `6` | Max concurrent worker threads for pre-warming |
+| :--- | :--- | :--- |
+| `HOST` | `0.0.0.0` | IP address to bind listeners |
+| `DNS_PORT` | `53` | Plain UDP/TCP DNS port (fallback: `5053`) |
+| `DOT_PORT` | `853` | DNS-over-TLS port (fallback: `8853`) |
+| `DOH_PORT` | `443` | DNS-over-HTTPS port (fallback: `8443`, or `3053` behind Nginx) |
+| `DOH_NO_TLS` | `0` | Set to `1` for plain HTTP backend mode when Nginx terminates TLS |
+| `DNSSEC_ENFORCE` | `0` | Set to `1` to strictly return SERVFAIL on broken public DNSSEC chains |
+| `RATE_LIMIT_BURST` | `300` | Maximum queries a single client IP can burst |
+| `RATE_LIMIT_PER_SEC` | `60` | Sustained queries per second allowed per IP |
+| `CERT_PATH` | `fullchain.pem` | Path to TLS certificate |
+| `KEY_PATH` | `privkey.pem` | Path to TLS private key |
+| `WARM_LIMIT` | `0` | Number of top Tranco domains to pre-warm on boot (`0` = disabled) |
+| `WARM_CONCURRENCY` | `6` | Maximum worker concurrency for cache pre-warming |
 
 ---
 
-## Deployment Setup
+## Build & Installation
+
+### 1. Compile
+
+:::bash
+cargo build --release
+:::
+
+The compiled binary will be located at `./target/release/doh-server`.
+
+### 2. Network Capabilities (Optional)
+
+If running the daemon under an unprivileged user while binding to privileged ports (53, 853, 443):
+
+:::bash
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
+:::
+
+---
+
+## Deployment Configuration
 
 ### 1. Systemd Service
 
 Create `/etc/systemd/system/doh-server.service`:
 
-```ini
+:::ini
 [Unit]
-Description=Unified DNS Server (DoH + Port 53 UDP/TCP)
+Description=Unified Recursive DNS Server (DoH / DoT / Plain DNS)
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/myuser/dns
-Environment=PORT=3053
-Environment=DOH_PORT=3053
-Environment=DOT_PORT=853
-Environment=DNS_PORT=53
-Environment=HOST=0.0.0.0
-Environment=CACHE_FILE=/home/my_user/dns/cache.json
-Environment=CERT_PATH=/etc/ssl/certs/dns.example.com.crt
-Environment=KEY_PATH=/etc/ssl/private/dns.example.com.key
-ExecStart=/home/my_user/dns/target/release/doh-server
-Environment=WARM_LIMIT=20000
-Environment=WARM_CONCURRENCY=6
+WorkingDirectory=/home/azbrand/dns
+ExecStart=/home/azbrand/dns/target/release/doh-server
+
+Environment="HOST=0.0.0.0"
+Environment="DNS_PORT=53"
+Environment="DOT_PORT=853"
+Environment="DOH_PORT=3053"
+Environment="DOH_NO_TLS=1"
+Environment="RATE_LIMIT_BURST=300"
+Environment="RATE_LIMIT_PER_SEC=60"
+Environment="CERT_PATH=/etc/letsencrypt/live/dns.example.com/fullchain.pem"
+Environment="KEY_PATH=/etc/letsencrypt/live/dns.example.com/privkey.pem"
+Environment="RUST_LOG=info,doh_server=info"
+
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-```
+:::
 
 Enable and start the service:
 
-```bash
+:::bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now doh-server.service
-```
+:::
 
 ---
 
 ### 2. Nginx Reverse Proxy (Port 443 DoH Termination)
 
-When proxying DoH through Nginx, Nginx handles HTTPS on port 443 and passes queries to `doh-server` running on port `3053`.
+When proxying DoH through Nginx with `DOH_NO_TLS=1`, Nginx terminates public HTTPS on port 443 and passes plain HTTP queries to `127.0.0.1:3053`:
 
-> **Note**: Because `doh-server` serves TLS directly on its configured backend port, `proxy_pass` must use `https://` with `proxy_ssl_verify off;`.
-
-Create `/etc/nginx/sites-available/dns.example.com`:
-
-```nginx
+:::nginx
 upstream doh_backend {
     server 127.0.0.1:3053;
     keepalive 64;
 }
 
-# HTTP Server (Port 80)
 server {
     listen 80;
     listen [::]:80;
@@ -126,7 +143,6 @@ server {
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
-        default_type "text/plain";
     }
 
     location / {
@@ -134,93 +150,69 @@ server {
     }
 }
 
-# HTTPS Server (Port 443)
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name dns.example.com;
 
-    ssl_certificate /etc/ssl/certs/dns.example.com.crt;
-    ssl_certificate_key /etc/ssl/private/dns.example.com.key;
+    ssl_certificate /etc/letsencrypt/live/dns.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dns.example.com/privkey.pem;
 
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-        default_type "text/plain";
-    }
-
-    ssl_session_cache shared:DOH_SSL:20m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets on;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
-
-    keepalive_timeout 120s;
-    keepalive_requests 10000;
+    ssl_session_cache shared:DOH_SSL:20m;
+    ssl_session_timeout 1d;
 
     client_max_body_size 10k;
 
-    location / {
-        proxy_pass https://doh_backend;
-        proxy_ssl_verify off;
+    location /dns-query {
+        proxy_pass http://doh_backend/dns-query;
         proxy_http_version 1.1;
 
         proxy_set_header Connection "";
         proxy_set_header Host $host;
-
-        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Content-Type application/dns-message;
 
-        proxy_request_buffering off;
         proxy_buffering off;
+        proxy_request_buffering off;
+    }
 
-        proxy_connect_timeout 3s;
-        proxy_send_timeout 5s;
-        proxy_read_timeout 5s;
+    location /health {
+        proxy_pass http://doh_backend/health;
+        proxy_set_header Host $host;
     }
 }
-```
-
-Enable the vhost configuration:
-
-```bash
-sudo ln -s /etc/nginx/sites-available/dns.example.com /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
----
-
-## Client Configuration
-
-* **Android (Private DNS / DoT)**:
-  `Settings` → `Network & Internet` → `Private DNS` → `Private DNS provider hostname` → `dns.example.com`
-* **Web Browsers (DoH)**:
-  `Settings` → `Privacy & Security` → `Secure DNS` → Custom Provider URL: `https://dns.example.com/dns-query`
-* **Plain DNS**:
-  Set your router or network device's primary DNS address to your server's IPv4/IPv6 address.
+:::
 
 ---
 
 ## Verification & Testing
 
-### 1. Plain DNS Test (UDP/TCP Port 53)
-```bash
-dig @dns.example.com example.com
-```
+### 1. Plain DNS (UDP/TCP)
+:::bash
+dig @127.0.0.1 -p 53 example.com A
+dig +tcp @127.0.0.1 -p 53 example.com A
+:::
 
-### 2. DoT Test (TCP Port 853)
-```bash
+### 2. DNS-over-TLS (DoT)
+:::bash
 kdig -d @dns.example.com +tls example.com
-```
+:::
 
-### 3. DoH Native Test (HTTPS Port 443)
-```bash
-dig +https @dns.example.com example.com
-```
+### 3. DNS-over-HTTPS (DoH)
+:::bash
+# Health endpoint
+curl -s https://dns.example.com/health
 
-### 4. Direct RFC 8484 DoH Curl Test
-```bash
-curl -i -H 'accept: application/dns-message' \
-  '[https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAEC](https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAEC)'
-```
+# RFC 8484 GET query
+curl -s -H "Accept: application/dns-message" \
+  "https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+:::
+
+### 4. DNSSEC Verification
+Run an end-to-end verification through `dnscheck.tools`:
+* Open `https://dnscheck.tools/` in a browser configured to use your DoH or DoT endpoint.
+* All checks for **Valid**, **Invalid**, **Expired**, and **Missing** signatures will report **PASS (green)** across ECDSA P-256, P-384, and Ed25519.
+EOF
