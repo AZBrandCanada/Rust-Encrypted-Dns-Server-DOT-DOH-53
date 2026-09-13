@@ -4,6 +4,7 @@ use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::ratelimit::{RateLimiter, RrlAction};
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ pub async fn process_dns_wire(
                 client = %client_ip,
                 domain = %qname,
                 rtype = %qtype,
-                "[SECURITY] RRL threshold reached; challenging client with TC=1 (45 bytes)"
+                "[SECURITY] Challenging client with TC=1 (45 bytes)"
             );
             return make_truncated_wire(req_msg.id(), Some(query));
         }
@@ -61,7 +62,7 @@ pub async fn process_dns_wire(
                 client = %client_ip,
                 domain = %qname,
                 rtype = %qtype,
-                "[SECURITY] Flood threshold exceeded; dropped query (0 bytes)"
+                "[SECURITY] Flood dropped (0 bytes)"
             );
             return Vec::new();
         }
@@ -144,14 +145,14 @@ pub async fn process_dns_wire(
             );
         }
 
-        // Amplification Guard: Challenge large UDP responses if volume is high
+        // Strict Amplification Defense: Never allow large packets (> 512 bytes) on plain UDP
         if state.rate_limiter.should_challenge_large_response(protocol, client_ip, entry.raw_wire.len()) {
             tracing::warn!(
                 protocol,
                 client = %client_ip,
                 domain = %qname,
                 resp_bytes = entry.raw_wire.len(),
-                "[SECURITY] Large UDP cache hit challenged with TC=1 to prevent reflection"
+                "[SECURITY] Large UDP response challenged with TC=1 (zero amplification)"
             );
             return make_truncated_wire(req_msg.id(), Some(query));
         }

@@ -69,6 +69,7 @@ impl RateLimiter {
             return RrlAction::Allow;
         }
 
+        // RFC 8482: Drop all ANY queries over plain UDP immediately
         if qtype == RecordType::ANY {
             return RrlAction::Drop;
         }
@@ -99,7 +100,7 @@ impl RateLimiter {
 
         let current_tokens = bucket.tokens.load(Ordering::Relaxed);
         if current_tokens <= 0 {
-            return RrlAction::Truncate;
+            return RrlAction::Drop;
         }
         bucket.tokens.fetch_sub(1, Ordering::Relaxed);
 
@@ -118,15 +119,19 @@ impl RateLimiter {
 
         let query_rate = domain_entry.count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if query_rate <= 3 {
+        if query_rate == 1 {
             RrlAction::Allow
-        } else if query_rate <= 6 {
+        } else if query_rate <= 3 {
+            // Rapid repetition: challenge immediately with TC=1
             RrlAction::Truncate
         } else {
+            // Flood detected: drop completely
             RrlAction::Drop
         }
     }
 
+    /// Zero-Tolerance Amplification Guard:
+    /// Any UDP response over 512 bytes is challenged with TC=1 (45 bytes) to guarantee ZERO amplification.
     pub fn should_challenge_large_response(
         &self,
         protocol: &str,
@@ -137,15 +142,8 @@ impl RateLimiter {
             return false;
         }
 
-        if resp_bytes > 512 {
-            let subnet = Self::to_subnet(client_ip);
-            if let Some(entry) = self.subnet_buckets.get(&subnet) {
-                if entry.tokens.load(Ordering::Relaxed) < (self.capacity / 2) {
-                    return true;
-                }
-            }
-        }
-        false
+        // Strict limit: never send > 512 bytes over plain unauthenticated UDP
+        resp_bytes > 512
     }
 
     pub fn cleanup(&self, max_age: Duration) {
