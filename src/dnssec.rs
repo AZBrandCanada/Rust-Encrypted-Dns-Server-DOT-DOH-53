@@ -733,10 +733,15 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                     .iter()
                     .filter_map(|d| {
                         let dt = u8::from(d.digest_type());
-                        if dt == 2 || dt == 4 {
+                        let alg = u8::from(d.algorithm());
+                        
+                        // Check both digest type AND that the algorithm is one you actually support!
+                        let alg_supported = matches!(alg, 8 | 10 | 13 | 14 | 15 | 18);
+
+                        if (dt == 2 || dt == 4) && alg_supported {
                             Some((
                                 d.key_tag(),
-                                u8::from(d.algorithm()),
+                                alg,
                                 dt,
                                 d.digest().to_vec(),
                             ))
