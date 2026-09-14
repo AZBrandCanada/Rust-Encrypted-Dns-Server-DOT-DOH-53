@@ -23,13 +23,21 @@ fn is_cacheable(msg: &Message) -> bool {
     matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain)
 }
 
-/// Normalize the flags on a fresh response Message destined for a recursive
-/// client:
-///   * AA must be cleared (we are not authoritative)
-///   * RA must be set (we do offer recursion)
-///   * RD must echo the client's RD
-///   * CD must echo the client's CD
-///   * AD is set by the caller based on the DNSSEC verdict
+/// DNSSEC verdicts that are safe to persist in the response cache.
+///
+/// `InsecureUnknown` is deliberately excluded: it means "we could not
+/// complete validation right now", and caching it would turn a transient
+/// upstream failure into a sticky downgrade (RFC 4035 §4.3 says a validating
+/// resolver should not serve unvalidated data with an AD bit set, and the
+/// safest way to honour that is to recompute on every request until we
+/// either get a definitive verdict or the upstream recovers).
+fn is_cacheable_dnssec(status: DnssecStatus) -> bool {
+    matches!(
+        status,
+        DnssecStatus::Secure | DnssecStatus::InsecureUnsigned
+    )
+}
+
 fn normalize_response_flags(resp: &mut Message, req: &Message, ad: bool) {
     resp.set_authoritative(false);
     resp.set_recursion_available(true);
@@ -38,25 +46,20 @@ fn normalize_response_flags(resp: &mut Message, req: &Message, ad: bool) {
     resp.set_authentic_data(ad);
 }
 
-/// Rewrite the flags of an already-encoded wire response so that it is
-/// suitable for the given client.  Preserves RCODE and the resolver's AD
-/// verdict; clears AA; sets RA; echoes RD and CD from the request; rewrites
-/// the transaction ID.
 fn normalize_cached_wire(wire: &mut [u8], req_wire: &[u8]) {
     if wire.len() < 4 || req_wire.len() < 4 {
         return;
     }
-    // Transaction ID
     wire[0] = req_wire[0];
     wire[1] = req_wire[1];
 
     let client_flags = u16::from_be_bytes([req_wire[2], req_wire[3]]);
     let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
 
-    flags &= !0x0400;                                     // clear AA  (bit 10)
-    flags |= 0x0080;                                      // set RA    (bit 7)
-    flags = (flags & !0x0100) | (client_flags & 0x0100);  // echo RD   (bit 8)
-    flags = (flags & !0x0010) | (client_flags & 0x0010);  // echo CD   (bit 4)
+    flags &= !0x0400;                                     // clear AA
+    flags |= 0x0080;                                      // set RA
+    flags = (flags & !0x0100) | (client_flags & 0x0100);  // echo RD
+    flags = (flags & !0x0010) | (client_flags & 0x0010);  // echo CD
 
     wire[2] = (flags >> 8) as u8;
     wire[3] = (flags & 0xff) as u8;
@@ -154,7 +157,7 @@ pub async fn process_dns_wire(
                             DnssecStatus::Secure => {
                                 fresh_msg.set_authentic_data(true);
                             }
-                            DnssecStatus::Insecure => {
+                            DnssecStatus::InsecureUnsigned | DnssecStatus::InsecureUnknown => {
                                 fresh_msg.set_authentic_data(false);
                             }
                             DnssecStatus::Bogus => {
@@ -169,10 +172,7 @@ pub async fn process_dns_wire(
                             }
                         }
 
-                        if is_cacheable(&fresh_msg) {
-                            // Normalize flags before caching, so that
-                            // every cache read serves a correctly shaped
-                            // response.
+                        if is_cacheable(&fresh_msg) && is_cacheable_dnssec(status) {
                             fresh_msg.set_authoritative(false);
                             fresh_msg.set_recursion_available(true);
                             if let Ok(wire) = fresh_msg.to_bytes() {
@@ -226,11 +226,13 @@ pub async fn process_dns_wire(
             )
             .await;
 
+            let client_cd = req_msg.checking_disabled();
+
             let ad = match dnssec_status {
                 DnssecStatus::Secure => true,
-                DnssecStatus::Insecure => false,
+                DnssecStatus::InsecureUnsigned | DnssecStatus::InsecureUnknown => false,
                 DnssecStatus::Bogus => {
-                    if state.dnssec_enforce {
+                    if state.dnssec_enforce && !client_cd {
                         tracing::warn!(
                             protocol,
                             client = %client_ip,
@@ -241,21 +243,29 @@ pub async fn process_dns_wire(
                         );
                         return make_servfail_wire(req_msg.id(), Some(query));
                     }
-                    tracing::warn!(
-                        protocol,
-                        client = %client_ip,
-                        domain = %qname,
-                        rtype = %qtype,
-                        "[DNSSEC] Bogus DNSSEC proof; enforcement disabled, \
-                         serving with AD=0"
-                    );
+                    if client_cd {
+                        tracing::debug!(
+                            protocol,
+                            client = %client_ip,
+                            domain = %qname,
+                            rtype = %qtype,
+                            "[DNSSEC] Bogus proof but client set CD=1; \
+                             serving with AD=0"
+                        );
+                    } else {
+                        tracing::warn!(
+                            protocol,
+                            client = %client_ip,
+                            domain = %qname,
+                            rtype = %qtype,
+                            "[DNSSEC] Bogus DNSSEC proof; enforcement disabled, \
+                             serving with AD=0"
+                        );
+                    }
                     false
                 }
             };
 
-            // Normalize the response for the client BEFORE we cache or
-            // return it.  This clears the upstream AA bit, sets RA, and
-            // echoes RD/CD from the client request.
             normalize_response_flags(&mut resp_msg, &req_msg, ad);
             resp_msg.set_id(req_msg.id());
 
@@ -264,7 +274,9 @@ pub async fn process_dns_wire(
                 Err(_) => return make_servfail_wire(req_msg.id(), Some(query)),
             };
 
-            if is_cacheable(&resp_msg) {
+            // Only cache when we have a definitive verdict AND the RCODE is
+            // cacheable.  InsecureUnknown is served but never persisted.
+            if is_cacheable(&resp_msg) && is_cacheable_dnssec(dnssec_status) {
                 let ttl = calculate_min_ttl(&resp_msg);
                 state.cache.insert(
                     cache_key,
@@ -274,6 +286,14 @@ pub async fn process_dns_wire(
                         cached_at: now,
                         last_revalidated_at: now,
                     },
+                );
+            } else if dnssec_status == DnssecStatus::InsecureUnknown {
+                tracing::debug!(
+                    protocol,
+                    client = %client_ip,
+                    domain = %qname,
+                    rtype = %qtype,
+                    "[DNSSEC] InsecureUnknown verdict; serving without caching"
                 );
             }
 

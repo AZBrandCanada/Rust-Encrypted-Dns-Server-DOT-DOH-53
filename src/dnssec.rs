@@ -14,6 +14,7 @@ use ml_dsa::{
 use ring::digest;
 use ring::signature;
 use sha2::{Digest, Sha256, Sha384};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -21,12 +22,36 @@ const MAX_SIG_CHECKS: usize = 8;               // KeyTrap (CVE-2023-50387)
 const MAX_NEGATIVE_RECORDS: usize = 8;         // cap NSEC/NSEC3 records processed
 const MAX_NSEC3_ITERATIONS: u16 = 150;         // RFC 9276 recommendation
 const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;  // bounded walk
+const MAX_CNAME_CHAIN: usize = 16;             // bounded CNAME chain walk
 
+/// DNSSEC verdict for a response.
+///
+/// `Insecure` is split into two variants so the cache layer can tell the
+/// difference between "this zone is genuinely unsigned" (safe to cache) and
+/// "we couldn't complete validation" (must not be cached, or a transient
+/// upstream failure becomes a sticky downgrade).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
+    /// Cryptographically validated end-to-end.
     Secure,
-    Insecure,
+    /// Zone positively proven unsigned: the parent returned DS NODATA.
+    InsecureUnsigned,
+    /// Signedness could not be determined (transient chain-build failure).
+    /// Served with AD=0 but MUST NOT be cached.
+    InsecureUnknown,
+    /// Signed zone with a failed or missing proof.
     Bogus,
+}
+
+/// Result of asking "is this name inside a signed zone?"
+///
+/// `Unknown` exists so that a transient DS/DNSKEY fetch failure doesn't get
+/// silently conflated with "the zone is unsigned".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoneSignedness {
+    Signed,
+    ProvenUnsigned,
+    Unknown,
 }
 
 const ROOT_TRUST_ANCHORS: &[(u16, u8, u8, &str)] = &[
@@ -41,6 +66,16 @@ struct CachedZoneKeys {
 
 fn key_trust_cache() -> &'static DashMap<String, CachedZoneKeys> {
     static CACHE: OnceLock<DashMap<String, CachedZoneKeys>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+struct SignedZoneEntry {
+    signedness: ZoneSignedness,
+    expires_at: u64,
+}
+
+fn signed_zone_cache() -> &'static DashMap<String, SignedZoneEntry> {
+    static CACHE: OnceLock<DashMap<String, SignedZoneEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
 
@@ -67,42 +102,87 @@ impl DnssecValidator {
         }
     }
 
+    /// Validate the answer section of a positive response.
+    ///
+    /// RFC 4035 §5.3.1: when following a CNAME/DNAME chain, EVERY RRset in
+    /// the chain must be signed by an authorized zone, and the final RRset of
+    /// the requested type must also be signed.
     pub async fn validate_answer(
         recursor: &RecursiveResolver,
         name: &Name,
         rtype: RecordType,
         all_records: &[Record],
     ) -> DnssecStatus {
-        let name_str = name.to_string().to_lowercase();
+        let chain: Vec<(Name, Name)> = if rtype == RecordType::CNAME {
+            Vec::new()
+        } else {
+            collect_cname_chain(name, all_records)
+        };
 
-        if (name_str.contains("nosig") || name_str.contains("no-sig"))
-            && all_records
+        for (owner, _target) in &chain {
+            let cname_records: Vec<Record> = all_records
                 .iter()
-                .all(|r| !matches!(r.data(), RData::DNSSEC(DNSSECRData::RRSIG(_))))
-        {
-            return DnssecStatus::Bogus;
+                .filter(|r| r.name() == owner && r.record_type() == RecordType::CNAME)
+                .cloned()
+                .collect();
+
+            if cname_records.is_empty() {
+                return DnssecStatus::Bogus;
+            }
+
+            match Self::validate_rrset(
+                recursor,
+                owner,
+                RecordType::CNAME,
+                &cname_records,
+                all_records,
+            )
+            .await
+            {
+                DnssecStatus::Secure => {}
+                other => return other,
+            }
         }
+
+        let final_owner = chain
+            .last()
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| name.clone());
 
         let target_records: Vec<Record> = all_records
             .iter()
-            .filter(|r| r.record_type() == rtype)
+            .filter(|r| r.name() == &final_owner && r.record_type() == rtype)
             .cloned()
             .collect();
+
         if target_records.is_empty() {
             tracing::debug!(
                 name = %name,
+                final_owner = %final_owner,
                 qtype = ?rtype,
-                "[DNSSEC] No records of requested type; treating as Insecure"
+                cname_hops = chain.len(),
+                "[DNSSEC] No records of requested type at final owner; treating as Unknown"
             );
-            return DnssecStatus::Insecure;
+            return DnssecStatus::InsecureUnknown;
         }
 
-        let rrset_owner = target_records[0].name().clone();
+        Self::validate_rrset(recursor, &final_owner, rtype, &target_records, all_records).await
+    }
 
+    /// Validate a single RRset (all records share owner + rtype).
+    async fn validate_rrset(
+        recursor: &RecursiveResolver,
+        owner: &Name,
+        rtype: RecordType,
+        target_records: &[Record],
+        all_records: &[Record],
+    ) -> DnssecStatus {
         let rrsigs: Vec<RRSIG> = all_records
             .iter()
             .filter_map(|r| match r.data() {
-                RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                    if sig.type_covered() == rtype && r.name() == owner =>
+                {
                     Some(sig.clone())
                 }
                 _ => None,
@@ -110,12 +190,33 @@ impl DnssecValidator {
             .collect();
 
         if rrsigs.is_empty() {
-            tracing::debug!(
-                owner = %rrset_owner,
-                qtype = ?rtype,
-                "[DNSSEC] No RRSIG covering requested type; treating as Insecure"
-            );
-            return DnssecStatus::Insecure;
+            return match is_zone_signed(recursor, owner).await {
+                ZoneSignedness::Signed => {
+                    tracing::warn!(
+                        owner = %owner,
+                        qtype = ?rtype,
+                        "[DNSSEC] Missing RRSIG for RRset in signed zone; Bogus"
+                    );
+                    DnssecStatus::Bogus
+                }
+                ZoneSignedness::ProvenUnsigned => {
+                    tracing::debug!(
+                        owner = %owner,
+                        qtype = ?rtype,
+                        "[DNSSEC] No RRSIG and zone proven unsigned; Insecure"
+                    );
+                    DnssecStatus::InsecureUnsigned
+                }
+                ZoneSignedness::Unknown => {
+                    tracing::warn!(
+                        owner = %owner,
+                        qtype = ?rtype,
+                        "[DNSSEC] No RRSIG and zone signedness unknown; \
+                         Insecure (uncacheable)"
+                    );
+                    DnssecStatus::InsecureUnknown
+                }
+            };
         }
 
         let now = now_secs();
@@ -125,7 +226,7 @@ impl DnssecValidator {
             let inc = rrsig.sig_inception().get() as u64;
             if now > exp || now < inc {
                 tracing::debug!(
-                    owner = %rrset_owner,
+                    owner = %owner,
                     expiration = exp,
                     inception = inc,
                     now,
@@ -135,12 +236,14 @@ impl DnssecValidator {
             }
         }
 
+        let mut any_trusted_chain = false;
+
         for rrsig in &rrsigs {
             let zone = rrsig.signer_name();
 
-            if !zone.zone_of(&rrset_owner) && zone != &rrset_owner {
+            if !zone.zone_of(owner) && zone != owner {
                 tracing::warn!(
-                    owner = %rrset_owner,
+                    owner = %owner,
                     signer = %zone,
                     "[DNSSEC] Unauthorized signer for RRset; returning Bogus"
                 );
@@ -149,12 +252,13 @@ impl DnssecValidator {
 
             match Self::build_trust_chain(recursor, zone).await {
                 ChainResult::Trusted(trusted_keys) => {
+                    any_trusted_chain = true;
                     let mut checks_performed = 0;
                     for dnskey in &trusted_keys {
                         checks_performed += 1;
                         if checks_performed > MAX_SIG_CHECKS {
                             tracing::warn!(
-                                name = %rrset_owner,
+                                name = %owner,
                                 "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting"
                             );
                             return DnssecStatus::Bogus;
@@ -163,10 +267,10 @@ impl DnssecValidator {
                         let key_tag = compute_key_tag(dnskey).unwrap_or(u16::MAX);
                         let tag_match = key_tag == rrsig.key_tag();
                         let sig_ok = tag_match
-                            && Self::verify_rrsig(rrsig, dnskey, &rrset_owner, &target_records);
+                            && Self::verify_rrsig(rrsig, dnskey, owner, target_records);
 
                         tracing::debug!(
-                            owner = %rrset_owner,
+                            owner = %owner,
                             signer = %zone,
                             rrsig_tag = rrsig.key_tag(),
                             dnskey_tag = key_tag,
@@ -183,7 +287,7 @@ impl DnssecValidator {
                 ChainResult::Unsigned => {
                     tracing::debug!(
                         signer = %zone,
-                        owner = %rrset_owner,
+                        owner = %owner,
                         "[DNSSEC] Trust chain returned Unsigned for signer"
                     );
                 }
@@ -193,17 +297,27 @@ impl DnssecValidator {
             }
         }
 
-        if name_str.contains("badsig") || name_str.contains("bad-sig") {
+        // RRSIGs present but none validated.
+        if any_trusted_chain {
+            tracing::warn!(
+                owner = %owner,
+                qtype = ?rtype,
+                rrsig_count = rrsigs.len(),
+                "[DNSSEC] No RRSIG verified against a trusted chain; Bogus"
+            );
             return DnssecStatus::Bogus;
         }
 
+        // Every signer's chain came back Unsigned, meaning a DS NODATA was
+        // returned at the parent for each. That positively identifies an
+        // unsigned zone, so this is InsecureUnsigned (cacheable).
         tracing::warn!(
-            owner = %rrset_owner,
+            owner = %owner,
             qtype = ?rtype,
             rrsig_count = rrsigs.len(),
-            "[DNSSEC] Validation fell through all RRSIGs; returning Insecure"
+            "[DNSSEC] Validation fell through all RRSIGs with unsigned chains; Insecure"
         );
-        DnssecStatus::Insecure
+        DnssecStatus::InsecureUnsigned
     }
 
     async fn validate_negative(
@@ -221,9 +335,9 @@ impl DnssecValidator {
             None => {
                 tracing::debug!(
                     qname = %qname,
-                    "[DNSSEC] Negative response has no SOA; treating as Insecure"
+                    "[DNSSEC] Negative response has no SOA; treating as Unknown"
                 );
-                return DnssecStatus::Insecure;
+                return DnssecStatus::InsecureUnknown;
             }
         };
 
@@ -235,7 +349,7 @@ impl DnssecValidator {
                     qname = %qname,
                     "[DNSSEC] Negative: trust chain Unsigned; treating as Insecure"
                 );
-                return DnssecStatus::Insecure;
+                return DnssecStatus::InsecureUnsigned;
             }
             ChainResult::Bogus => {
                 tracing::warn!(
@@ -397,15 +511,15 @@ impl DnssecValidator {
         let algorithm = first.hash_algorithm();
 
         if algorithm != Nsec3HashAlgorithm::SHA1 {
-            tracing::warn!("[DNSSEC] Unsupported NSEC3 hash algorithm; Insecure");
-            return DnssecStatus::Insecure;
+            tracing::warn!("[DNSSEC] Unsupported NSEC3 hash algorithm; Unknown");
+            return DnssecStatus::InsecureUnknown;
         }
         if iterations > MAX_NSEC3_ITERATIONS {
             tracing::warn!(
                 iterations,
-                "[DNSSEC] NSEC3 iterations exceed RFC 9276 cap; Insecure"
+                "[DNSSEC] NSEC3 iterations exceed RFC 9276 cap; Unknown"
             );
-            return DnssecStatus::Insecure;
+            return DnssecStatus::InsecureUnknown;
         }
 
         for &rec in &nsec3_records {
@@ -521,9 +635,9 @@ impl DnssecValidator {
                     tracing::warn!(
                         zone = %zone,
                         error = %err,
-                        "[DNSSEC] Failed to fetch DNSKEY; returning Unsigned"
+                        "[DNSSEC] Failed to fetch DNSKEY; Bogus (fail-closed)"
                     );
-                    return ChainResult::Unsigned;
+                    return ChainResult::Bogus;
                 }
             };
 
@@ -539,9 +653,10 @@ impl DnssecValidator {
             if candidates.is_empty() {
                 tracing::warn!(
                     zone = %zone,
-                    "[DNSSEC] DNSKEY query returned no keys; returning Unsigned"
+                    "[DNSSEC] DNSKEY query returned no keys for a signer \
+                     zone; Bogus (fail-closed)"
                 );
-                return ChainResult::Unsigned;
+                return ChainResult::Bogus;
             }
 
             let dnskey_rrsigs: Vec<RRSIG> = dnskey_msg
@@ -559,12 +674,11 @@ impl DnssecValidator {
             if dnskey_rrsigs.is_empty() {
                 tracing::warn!(
                     zone = %zone,
-                    "[DNSSEC] DNSKEY RRset has no RRSIG; returning Unsigned"
+                    "[DNSSEC] DNSKEY RRset has no RRSIG; Bogus (fail-closed)"
                 );
-                return ChainResult::Unsigned;
+                return ChainResult::Bogus;
             }
 
-            // trusted_ds: (key_tag, algorithm, digest_type, digest_bytes)
             let trusted_ds: Vec<(u16, u8, u8, Vec<u8>)> = if zone.is_root() {
                 ROOT_TRUST_ANCHORS
                     .iter()
@@ -590,9 +704,9 @@ impl DnssecValidator {
                         tracing::warn!(
                             zone = %zone,
                             error = %err,
-                            "[DNSSEC] Failed to fetch DS; returning Unsigned"
+                            "[DNSSEC] Failed to fetch DS; Bogus (fail-closed)"
                         );
-                        return ChainResult::Unsigned;
+                        return ChainResult::Bogus;
                     }
                 };
 
@@ -659,10 +773,6 @@ impl DnssecValidator {
                     return ChainResult::Bogus;
                 }
 
-                // RFC 4509: digest type 2 = SHA-256 (used with RSA and Ed25519)
-                // RFC 6605: digest type 4 = SHA-384 (required for ECDSA P-384)
-                // We accept both; digest types 1 (SHA-1) and 3 (GOST) are
-                // obsolete and intentionally rejected.
                 let anchors: Vec<(u16, u8, u8, Vec<u8>)> = ds_records
                     .iter()
                     .filter_map(|d| {
@@ -682,7 +792,7 @@ impl DnssecValidator {
                 if anchors.is_empty() {
                     tracing::warn!(
                         zone = %zone,
-                        "[DNSSEC] DS RRset has no SHA-256 or SHA-384 digests; returning Unsigned"
+                        "[DNSSEC] DS RRset has no SHA-256 or SHA-384 digests; Unsigned"
                     );
                     return ChainResult::Unsigned;
                 }
@@ -736,10 +846,9 @@ impl DnssecValidator {
                     tracing::error!(
                         seen_root_keys = ?seen,
                         expected_anchors = ?expected,
-                        "[DNSSEC] Root trust anchor mismatch -- treating as Insecure instead of \
-                         Bogus. This is a code/config bug, please report the seen/expected values."
+                        "[DNSSEC] Root trust anchor mismatch; Bogus (fail-closed)"
                     );
-                    return ChainResult::Unsigned;
+                    return ChainResult::Bogus;
                 }
                 tracing::warn!(
                     zone = %zone,
@@ -770,10 +879,9 @@ impl DnssecValidator {
                 if zone.is_root() {
                     tracing::error!(
                         "[DNSSEC] Root DNSKEY RRset signature did not verify against a \
-                         trust-anchor-matched key -- treating as Insecure instead of Bogus \
-                         while this is debugged."
+                         trust-anchor-matched key; Bogus (fail-closed)"
                     );
-                    return ChainResult::Unsigned;
+                    return ChainResult::Bogus;
                 }
                 tracing::warn!(
                     zone = %zone,
@@ -829,6 +937,187 @@ impl DnssecValidator {
 
         dnskey.public_key().verify(&tbs, rrsig.sig()).is_ok()
     }
+}
+
+// -------------------------------------------------------------------------
+// CNAME chain helpers
+// -------------------------------------------------------------------------
+
+fn collect_cname_chain(name: &Name, records: &[Record]) -> Vec<(Name, Name)> {
+    let mut chain = Vec::new();
+    let mut current = name.clone();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    loop {
+        let key = current.to_string().to_lowercase();
+        if !seen.insert(key) {
+            break;
+        }
+        if chain.len() >= MAX_CNAME_CHAIN {
+            break;
+        }
+
+        let target = records.iter().find_map(|r| {
+            if r.name() == &current && r.record_type() == RecordType::CNAME {
+                if let RData::CNAME(c) = r.data() {
+                    return Some(c.0.clone());
+                }
+            }
+            None
+        });
+
+        match target {
+            Some(t) => {
+                chain.push((current.clone(), t.clone()));
+                current = t;
+            }
+            None => break,
+        }
+    }
+
+    chain
+}
+
+// -------------------------------------------------------------------------
+// Signed-zone detection for missing RRSIGs
+// -------------------------------------------------------------------------
+
+/// Ask the recursor whether `name` lies inside a signed zone.
+///
+/// Fast path: the SOA query response will include the SOA's RRSIG if the
+/// containing zone is signed. When we see that, we return `Signed` without
+/// even doing a DS lookup.
+///
+/// Slow path: no RRSIG on the SOA. Then query DS at the apex. A positive DS
+/// means the zone is signed; a clean NODATA means it is genuinely unsigned.
+/// A failure to complete either query returns `Unknown`, which propagates to
+/// `DnssecStatus::InsecureUnknown` and prevents caching.
+///
+/// The result is cached per zone for 5 minutes, but `Unknown` results are
+/// never cached so a transient failure doesn't stick.
+async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSignedness {
+    // Cheap fast-path via the signed-zone cache.
+    let cache = signed_zone_cache();
+    let mut cur = name.clone();
+    loop {
+        let key = cur.to_string().to_lowercase();
+        if let Some(entry) = cache.get(&key) {
+            if entry.expires_at > now_secs() {
+                return entry.signedness;
+            }
+        }
+        if cur.is_root() {
+            break;
+        }
+        cur = cur.base_name();
+    }
+
+    // Fast path: SOA query returns the SOA's own RRSIG when the zone is
+    // signed, so we can answer "yes" without a DS lookup.
+    let soa_msg = match recursor.resolve(name, RecordType::SOA).await {
+        Ok(m) => m,
+        Err(_) => return ZoneSignedness::Unknown,
+    };
+
+    let soa_has_rrsig = soa_msg
+        .answers()
+        .iter()
+        .chain(soa_msg.name_servers().iter())
+        .any(|r| {
+            matches!(
+                r.data(),
+                RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                    if sig.type_covered() == RecordType::SOA
+            )
+        });
+
+    // Find the zone apex from the SOA (may be in answers OR authority).
+    let zone = soa_msg
+        .answers()
+        .iter()
+        .chain(soa_msg.name_servers().iter())
+        .find_map(|r| {
+            if matches!(r.data(), RData::SOA(_)) {
+                Some(r.name().clone())
+            } else {
+                None
+            }
+        });
+
+    let zone = match zone {
+        Some(z) => z,
+        None => return ZoneSignedness::Unknown,
+    };
+
+    if soa_has_rrsig {
+        cache.insert(
+            zone.to_string().to_lowercase(),
+            SignedZoneEntry {
+                signedness: ZoneSignedness::Signed,
+                expires_at: now_secs() + 300,
+            },
+        );
+        tracing::debug!(
+            zone = %zone,
+            queried_name = %name,
+            "[DNSSEC] is_zone_signed: SOA carries RRSIG -> Signed"
+        );
+        return ZoneSignedness::Signed;
+    }
+
+    if zone.is_root() {
+        cache.insert(
+            zone.to_string().to_lowercase(),
+            SignedZoneEntry {
+                signedness: ZoneSignedness::Signed,
+                expires_at: now_secs() + 300,
+            },
+        );
+        return ZoneSignedness::Signed;
+    }
+
+    // Slow path: DS lookup at the apex.
+    let ds_msg = match recursor.resolve(&zone, RecordType::DS).await {
+        Ok(m) => m,
+        Err(_) => return ZoneSignedness::Unknown,
+    };
+
+    // Presence of a DS RRset is authoritative: it means the parent has
+    // committed to signing this zone. Absence means the zone is unsigned
+    // (per RFC 4035 §5.2) — but only if the response actually came from the
+    // parent's authoritative servers. We cannot prove that here, so we treat
+    // a clean NODATA as ProvenUnsigned and cache it; anything else is
+    // Unknown.
+    let ds_present = ds_msg.answers().iter().any(|r| {
+        r.record_type() == RecordType::DS && r.name() == &zone
+    });
+
+    let signedness = if ds_present {
+        ZoneSignedness::Signed
+    } else if ds_msg.response_code() == hickory_proto::op::ResponseCode::NoError {
+        ZoneSignedness::ProvenUnsigned
+    } else {
+        ZoneSignedness::Unknown
+    };
+
+    if signedness != ZoneSignedness::Unknown {
+        cache.insert(
+            zone.to_string().to_lowercase(),
+            SignedZoneEntry {
+                signedness,
+                expires_at: now_secs() + 300,
+            },
+        );
+    }
+
+    tracing::debug!(
+        zone = %zone,
+        queried_name = %name,
+        ?signedness,
+        "[DNSSEC] is_zone_signed resolved"
+    );
+
+    signedness
 }
 
 // -------------------------------------------------------------------------
@@ -971,17 +1260,6 @@ fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
     Some((ac & 0xFFFF) as u16)
 }
 
-/// RFC 4034 §5.1.4:
-///   digest = HASH( owner_name_wire || DNSKEY_RDATA )
-///
-/// Both owner and DNSKEY must be emitted into the SAME encoder so the
-/// write offset advances monotonically. Creating a second
-/// `BinEncoder::new(&mut buf)` resets the offset to 0 and overwrites the
-/// owner bytes.
-///
-/// `digest_type`:
-///   2 = SHA-256 (RFC 4509) -- used with RSA and Ed25519
-///   4 = SHA-384 (RFC 6605) -- required for ECDSA P-384
 fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     {
@@ -1011,7 +1289,6 @@ fn to_hex(bytes: &[u8]) -> String {
 fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
 
-    // RRSIG_RDATA (all fields except the signature itself).
     out.extend_from_slice(&(u16::from(rrsig.type_covered()).to_be_bytes()));
     out.push(u8::from(rrsig.algorithm()));
     out.push(rrsig.num_labels());
@@ -1020,10 +1297,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
     out.extend_from_slice(&rrsig.sig_inception().get().to_be_bytes());
     out.extend_from_slice(&rrsig.key_tag().to_be_bytes());
 
-    // Signer name: emit into its OWN buffer, then append.  Do NOT create a
-    // BinEncoder bound to `out` here -- BinEncoder::new(&mut vec) truncates
-    // the vec back to offset 0, which would erase the RRSIG_RDATA bytes we
-    // just wrote.
     {
         let mut name_buf = Vec::new();
         let mut encoder = BinEncoder::new(&mut name_buf);
@@ -1050,7 +1323,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
     let mut entries = Vec::new();
 
     for rec in records {
-        // RDATA in canonical form, emitted into its own buffer.
         let mut rdata_buf = Vec::new();
         {
             let mut rdata_encoder = BinEncoder::new(&mut rdata_buf);
@@ -1058,7 +1330,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
             rec.data().emit(&mut rdata_encoder).ok()?;
         }
 
-        // Full canonical RR: owner | type | class | orig_ttl | rdlength | rdata
         let mut full_buf = Vec::new();
         {
             let mut encoder = BinEncoder::new(&mut full_buf);
@@ -1077,7 +1348,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
         });
     }
 
-    // RFC 4034 §6.3: sort RRs by canonical RDATA.
     entries.sort_by(|a, b| a.rdata_bytes.cmp(&b.rdata_bytes));
 
     for e in entries {
@@ -1130,16 +1400,6 @@ fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], s
     }
 }
 
-/// ML-DSA-44 (DNSSEC Algorithm 18).
-///
-/// Sizes per FIPS 204 / draft-ietf-dnsop-ml-dsa-dnssec:
-///   * public key: 1,312 bytes
-///   * signature:  2,420 bytes
-///
-/// Both are pulled raw from the DNSKEY/RRSIG records. hickory-proto's
-/// `PublicKey` abstraction does not know about algorithm 18, so
-/// `dnskey.public_key().verify(...)` would always fail for these zones.
-/// We bypass it entirely and hand the raw bytes to the `ml-dsa` crate.
 fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
     let Ok(vk_enc) = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes) else {
         tracing::debug!(
@@ -1148,8 +1408,6 @@ fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
         );
         return false;
     };
-    // decode() is infallible: the encoded wrapper has already validated
-    // the fixed 1312-byte layout.
     let vk = MlDsaVerifyingKey::<MlDsa44>::decode(&vk_enc);
 
     let Ok(sig_enc) = EncodedSignature::<MlDsa44>::try_from(sig) else {
