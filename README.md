@@ -61,9 +61,9 @@ A high-performance, lightweight, multi-protocol recursive DNS server built in Ru
 
 ### 1. Compile
 
-:::bash
+'''bash
 cargo build --release
-:::
+'''
 
 The compiled binary will be located at `./target/release/doh-server`.
 
@@ -71,9 +71,9 @@ The compiled binary will be located at `./target/release/doh-server`.
 
 If running the daemon under an unprivileged user while binding to privileged ports (53, 853, 443):
 
-:::bash
+'''bash
 sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
-:::
+'''
 
 ---
 
@@ -83,7 +83,7 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
 
 Create `/etc/systemd/system/doh-server.service`:
 
-:::ini
+'''ini
 [Unit]
 Description=Unified Recursive DNS Server (DoH / DoT / Plain DNS)
 After=network.target
@@ -111,14 +111,14 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-:::
+'''
 
 Enable and start the service:
 
-:::bash
+'''bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now doh-server.service
-:::
+'''
 
 ---
 
@@ -126,7 +126,7 @@ sudo systemctl enable --now doh-server.service
 
 When proxying DoH through Nginx with `DOH_NO_TLS=1`, Nginx terminates public HTTPS on port 443 and passes plain HTTP queries to `127.0.0.1:3053`:
 
-:::nginx
+'''nginx
 upstream doh_backend {
     server 127.0.0.1:3053;
     keepalive 64;
@@ -180,32 +180,32 @@ server {
         proxy_set_header Host $host;
     }
 }
-:::
+'''
 
 ---
 
 ## Verification & Testing
 
 ### 1. Plain DNS (UDP/TCP)
-:::bash
+'''bash
 dig @127.0.0.1 -p 53 example.com A
 dig +tcp @127.0.0.1 -p 53 example.com A
-:::
+'''
 
 ### 2. DNS-over-TLS (DoT)
-:::bash
+'''bash
 kdig -d @dns.example.com +tls example.com
-:::
+'''
 
 ### 3. DNS-over-HTTPS (DoH)
-:::bash
+'''bash
 # Health endpoint
 curl -s https://dns.example.com/health
 
 # RFC 8484 GET query
 curl -s -H "Accept: application/dns-message" \
   "https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
-:::
+'''
 
 ### 4. DNSSEC Verification
 Run an end-to-end verification through `dnscheck.tools`:
