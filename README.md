@@ -2,7 +2,7 @@
 
 A high-performance, lightweight, multi-protocol recursive DNS resolver engineered in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) concurrently while performing independent, from-the-root iterative resolution without relying on upstream third-party resolvers (such as Google, Cloudflare, or Quad9).
 
-Built with production-grade security, comprehensive DNSSEC validation, anti-amplification defenses, SSRF immunity, and a stale-while-revalidate caching engine.
+Built with production-grade security, comprehensive DNSSEC validation (including post-quantum ML-DSA-44), anti-amplification defenses, SSRF immunity, and a stale-while-revalidate caching engine.
 
 ---
 
@@ -22,19 +22,21 @@ Built with production-grade security, comprehensive DNSSEC validation, anti-ampl
 * **Automatic TCP Fallback**: Detects truncation flags (`TC=1`) from upstream authoritative servers and automatically re-queries over length-prefixed TCP.
 * **Buffer Clamping (DNS Flag Day Compliance)**: Requests 1232-byte EDNS0 payload limits to avoid IP packet fragmentation over the public internet.
 * **Recursion Loop Protection**: Caps resolution depth (`MAX_DEPTH = 16`) and total steps (`MAX_STEPS = 16`) with cycle detection to abort endless CNAME chains and delegation loops.
+* **Glue Address Prioritization**: Prioritizes IPv4 addresses for authoritative nameservers, falling back to IPv6 glue only when IPv4 glue is unavailable.
 
-### Cryptographic DNSSEC Engine
-* **Full Trust Chain Validation**: Walks the chain of trust from hardcoded root anchors down through DS and DNSKEY records to validate RRSIGs using `ring`.
+### Cryptographic DNSSEC Engine (Classical & Post-Quantum)
+* **Full Trust Chain Validation**: Walks the chain of trust from hardcoded root anchors down through DS and DNSKEY records to validate RRSIGs.
 * **Current Root Anchors**: Built-in verification for root KSK-2017 (Key Tag `20326`) and root KSK-2024 (Key Tag `38696`).
-* **Broad Algorithm Support**:
-  * RSA: `RSASHA256` and `RSASHA512` (2048 to 8192 bits)
-  * ECDSA: `ECDSAP256SHA256` (P-256) and `ECDSAP384SHA384` (P-384)
-  * Ed25519: Curve25519 pure EdDSA
+* **Hybrid Verification Architecture**:
+  * **Optimized Classical Engine (`ring`)**: Hardware-accelerated verification for RSA (`RSASHA256`, `RSASHA512`, 2048–8192 bits), ECDSA (`ECDSAP256SHA256`, `ECDSAP384SHA384`), and Ed25519 (`ED25519`).
+  * **Native Protocol Fallback (`hickory-proto`)**: Direct delegation to Hickory's cryptographic verifier for extended and modern suites.
+* **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Native validation of post-quantum lattice signatures under **NIST FIPS 204 / DNSSEC Algorithm 18**, allowing full validation of PQ-signed zones (e.g. `test-alg18.dnscheck.tools`).
 * **RFC 4035 §5.3.4 Wildcard Synthesis**: Accurately detects and synthesizes wildcard labels before signature verification.
 * **RFC 4034 §6.3 Canonical Sorting**: Reorders RRset members strictly by canonical RDATA octets prior to digest verification.
 * **KeyTrap Mitigation (CVE-2023-50387)**: Enforces `MAX_SIG_CHECKS = 8` to protect against CPU exhaustion attacks from maliciously constructed DNSKEY sets.
 * **Authentic Data (AD) Flag**: Injects `AD=1` into responses when all records are cryptographically verified against the chain of trust.
-* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate on `dnscheck.tools`).
+* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate on `dnscheck.tools` across alg13, alg14, alg15, and alg18).
+* **Root Anchor Desync Fail-Open**: If the root anchor fails validation (e.g. an uncoordinated KSK rollover), the resolver fails open to Insecure rather than terminating resolution for the entire internet.
 
 ### Resolver Hardening & Security
 * **SSRF & Reflection Immunity**: Rejects any candidate upstream nameserver IP (from glue or resolved NS records) pointing to:
@@ -46,7 +48,7 @@ Built with production-grade security, comprehensive DNSSEC validation, anti-ampl
   * Broadcast, multicast, unspecified (`0.0.0.0/8`, `::`)
   * IPv6 Unique Local Addresses (`fc00::/7`) and IPv4-mapped IPv6 ranges
 * **Spoofed Reverse Proxy Header Protection**: Only trusts reverse-proxy headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) when the incoming TCP peer is verified to be a local loopback address (`127.0.0.1` or `::1`).
-* **Defense-in-Depth Query Filtering**: Refuses to dispatch outbound UDP/TCP packets to unsafe IPs at the physical socket layer.
+* **Defense-in-Depth Socket Filtering**: Refuses to dispatch outbound UDP/TCP packets to unsafe IPs at the physical socket layer.
 
 ### Abuse Defense & Rate Limiting (RRL)
 * **Subnet-Aware Token Bucket**: Aggregates traffic by `/24` IPv4 subnets and `/64` IPv6 prefixes to prevent attackers from rotating single IP addresses within a pool.
@@ -60,11 +62,17 @@ Built with production-grade security, comprehensive DNSSEC validation, anti-ampl
 
 ### Caching Engine
 * **Stale-While-Revalidate**: Serves expired cached records immediately with zero client latency while asynchronously re-resolving and validating the domain in the background.
-* **Request Coalescing**: Uses an in-flight synchronization registry to ensure duplicate background revalidations are never triggered simultaneously for the same RRset.
+* **Single-Flight Request Deduplication**: Uses an in-flight synchronization registry (`in_flight`) to ensure duplicate background revalidations are never triggered simultaneously for the same RRset.
+* **EDNS `DO` Bit Partitioning**: Separate cache keys for `do=0` and `do=1` ensure clients requesting plain records do not receive bloated DNSSEC signatures, while validating clients retain RRSIGs.
+* **Dynamic Transaction ID Rewriting**: Rewrites bytes 0 and 1 of cached wire responses on the fly to match the requesting client's query ID.
 * **Delegation Caching**: Caches intermediate zone delegations (NS records and glue). Queries jump directly to the closest known ancestor rather than walking from the root on every lookup.
 * **Negative & NODATA Caching**: Properly caches `NXDOMAIN` and empty `NOERROR` responses according to authority SOA TTL rules.
 * **Atomic Disk Persistence**: Asynchronously syncs the in-memory cache to disk every 120 seconds and on clean shutdown using atomic file replacement (`.tmp` write followed by rename).
 * **Tranco Cache Pre-warming**: Automatically downloads and unzips the Tranco Top 1M list on startup, warming the cache concurrently across A and AAAA records.
+
+### Diagnostic & Inspection Engine (`dnscheck.rs`)
+* **Real-Time Query Inspector**: Optional WebSocket watcher (`/watch/:client_id`) that streams incoming query metadata (remote IP, port, protocol, EDNS0 subnet, UDP buffer size) in real-time.
+* **Deterministic Test Flags**: Supports testing flags encoded into query labels (`nullip`, `truncate`, `badsig`, `expiredsig`, `nosig`) for automated client validation and DNSSEC compliance testing.
 
 ---
 
@@ -315,7 +323,10 @@ To verify full cryptographic chain verification:
 1. Configure your client or browser to point to your DoH or DoT endpoint.
 2. Visit [dnscheck.tools](https://dnscheck.tools/).
 3. Confirm that all DNSSEC test records pass:
-   * **Valid Signature**: Resolves successfully with `AD=1`.
+   * **ECDSA P-256 (alg13)**: Resolves successfully with `AD=1`.
+   * **ECDSA P-384 (alg14)**: Resolves successfully with `AD=1`.
+   * **Ed25519 (alg15)**: Resolves successfully with `AD=1`.
+   * **ML-DSA-44 (alg18)**: Post-quantum signatures resolve successfully with `AD=1`.
    * **Invalid / Bad Signature (`badsig`)**: Resolution fails with `SERVFAIL`.
    * **Expired Signature (`expiredsig`)**: Resolution fails with `SERVFAIL`.
    * **Missing Signature (`nosig`)**: Resolution fails with `SERVFAIL`.
