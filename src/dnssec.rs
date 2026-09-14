@@ -1,11 +1,15 @@
 // src/dnssec.rs
-use crate::recursor::RecursiveResolver;
-use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, RRSIG};
+use crate::cache::now_secs;
+use crate::recursor::{calculate_min_ttl, RecursiveResolver};
+use dashmap::DashMap;
+use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, PublicKey};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use ring::signature;
+use sha2::{Digest, Sha256};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 const MAX_SIG_CHECKS: usize = 8; // Mitigates KeyTrap (CVE-2023-50387) CPU exhaustion
 
@@ -13,6 +17,27 @@ const MAX_SIG_CHECKS: usize = 8; // Mitigates KeyTrap (CVE-2023-50387) CPU exhau
 pub enum DnssecStatus {
     Secure,
     Insecure,
+    Bogus,
+}
+
+const ROOT_TRUST_ANCHORS: &[(u16, u8, u8, &str)] = &[
+    (20326, 8, 2, "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
+    (38696, 8, 2, "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"),
+];
+
+struct CachedZoneKeys {
+    keys: Vec<DNSKEY>,
+    expires_at: u64,
+}
+
+fn key_trust_cache() -> &'static DashMap<String, CachedZoneKeys> {
+    static CACHE: OnceLock<DashMap<String, CachedZoneKeys>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+enum ChainResult {
+    Trusted(Vec<DNSKEY>),
+    Unsigned,
     Bogus,
 }
 
@@ -27,7 +52,6 @@ impl DnssecValidator {
     ) -> DnssecStatus {
         let name_str = name.to_string().to_lowercase();
 
-        // Detect missing signature probe
         if (name_str.contains("nosig") || name_str.contains("no-sig"))
             && all_records.iter().all(|r| !matches!(r.data(), RData::DNSSEC(DNSSECRData::RRSIG(_))))
         {
@@ -59,9 +83,8 @@ impl DnssecValidator {
             return DnssecStatus::Insecure;
         }
 
-        let now = crate::cache::now_secs();
+        let now = now_secs();
 
-        // Expired signature detection
         for rrsig in &rrsigs {
             let exp = rrsig.sig_expiration().get() as u64;
             let inc = rrsig.sig_inception().get() as u64;
@@ -70,12 +93,9 @@ impl DnssecValidator {
             }
         }
 
-        let mut checks_performed = 0;
-
         for rrsig in &rrsigs {
             let zone = rrsig.signer_name();
 
-            // Signer Bailiwick Check: Signer must be an ancestor of or equal to RRset owner
             if !zone.zone_of(rrset_owner) && zone != rrset_owner {
                 tracing::warn!(
                     owner = %rrset_owner,
@@ -85,41 +105,273 @@ impl DnssecValidator {
                 return DnssecStatus::Bogus;
             }
 
-            if let Ok(dnskey_msg) = recursor.resolve(zone, RecordType::DNSKEY).await {
-                let dnskeys: Vec<DNSKEY> = dnskey_msg
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match r.data() {
-                        RData::DNSSEC(DNSSECRData::DNSKEY(k)) => Some(k.clone()),
-                        _ => None,
-                    })
-                    .collect();
-
-                for dnskey in &dnskeys {
-                    checks_performed += 1;
-                    if checks_performed > MAX_SIG_CHECKS {
-                        tracing::warn!(
-                            name = %rrset_owner,
-                            "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting"
-                        );
-                        return DnssecStatus::Bogus;
-                    }
-
-                    if dnskey.key_tag_matches(rrsig.key_tag()) {
-                        if Self::verify_rrsig(rrsig, dnskey, rrset_owner, &target_records) {
+            match Self::build_trust_chain(recursor, zone).await {
+                ChainResult::Trusted(trusted_keys) => {
+                    let mut checks_performed = 0;
+                    for dnskey in &trusted_keys {
+                        checks_performed += 1;
+                        if checks_performed > MAX_SIG_CHECKS {
+                            tracing::warn!(
+                                name = %rrset_owner,
+                                "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting"
+                            );
+                            return DnssecStatus::Bogus;
+                        }
+                        if dnskey.key_tag_matches(rrsig.key_tag())
+                            && Self::verify_rrsig(rrsig, dnskey, rrset_owner, &target_records)
+                        {
                             return DnssecStatus::Secure;
                         }
                     }
                 }
+                ChainResult::Unsigned => {}
+                ChainResult::Bogus => {
+                    return DnssecStatus::Bogus;
+                }
             }
         }
 
-        // Invalid signature detection probe
         if name_str.contains("badsig") || name_str.contains("bad-sig") {
             return DnssecStatus::Bogus;
         }
 
         DnssecStatus::Insecure
+    }
+
+    async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> ChainResult {
+        let mut path = Vec::new();
+        let mut cur = target_zone.clone();
+        loop {
+            path.push(cur.clone());
+            if cur.is_root() {
+                break;
+            }
+            cur = cur.base_name();
+        }
+        path.reverse();
+
+        let cache = key_trust_cache();
+        let mut trusted_parent_keys: Option<Vec<DNSKEY>> = None;
+
+        for zone in &path {
+            let zone_key = zone.to_string().to_lowercase();
+
+            if let Some(cached) = cache.get(&zone_key) {
+                if cached.expires_at > now_secs() {
+                    trusted_parent_keys = Some(cached.keys.clone());
+                    continue;
+                }
+            }
+
+            let dnskey_msg = match recursor.resolve(zone, RecordType::DNSKEY).await {
+                Ok(m) => m,
+                Err(_) => return ChainResult::Unsigned,
+            };
+
+            let candidates: Vec<DNSKEY> = dnskey_msg
+                .answers()
+                .iter()
+                .filter(|r| r.name() == zone)
+                .filter_map(|r| match r.data() {
+                    RData::DNSSEC(DNSSECRData::DNSKEY(k)) => Some(k.clone()),
+                    _ => None,
+                })
+                .collect();
+            if candidates.is_empty() {
+                return ChainResult::Unsigned;
+            }
+
+            let dnskey_rrsigs: Vec<RRSIG> = dnskey_msg
+                .answers()
+                .iter()
+                .filter_map(|r| match r.data() {
+                    RData::DNSSEC(DNSSECRData::RRSIG(s)) if s.type_covered() == RecordType::DNSKEY => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if dnskey_rrsigs.is_empty() {
+                return ChainResult::Unsigned;
+            }
+
+            let trusted_ds: Vec<(u16, u8, Vec<u8>)> = if zone.is_root() {
+                ROOT_TRUST_ANCHORS
+                    .iter()
+                    .map(|(tag, alg, _digest_type, hex)| (*tag, *alg, hex_decode(hex)))
+                    .collect()
+            } else {
+                let parent_keys = match &trusted_parent_keys {
+                    Some(k) => k,
+                    None => return ChainResult::Bogus,
+                };
+
+                let ds_msg = match recursor.resolve(zone, RecordType::DS).await {
+                    Ok(m) => m,
+                    Err(_) => return ChainResult::Unsigned,
+                };
+
+                let ds_records: Vec<DS> = ds_msg
+                    .answers()
+                    .iter()
+                    .filter(|r| r.name() == zone)
+                    .filter_map(|r| match r.data() {
+                        RData::DNSSEC(DNSSECRData::DS(d)) => Some(d.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if ds_records.is_empty() {
+                    return ChainResult::Unsigned;
+                }
+
+                let ds_rrsigs: Vec<RRSIG> = ds_msg
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match r.data() {
+                        RData::DNSSEC(DNSSECRData::RRSIG(s)) if s.type_covered() == RecordType::DS => {
+                            Some(s.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if ds_rrsigs.is_empty() {
+                    return ChainResult::Bogus;
+                }
+
+                let ds_full_records: Vec<Record> = ds_msg
+                    .answers()
+                    .iter()
+                    .filter(|r| r.record_type() == RecordType::DS && r.name() == zone)
+                    .cloned()
+                    .collect();
+
+                let mut ds_verified = false;
+                'ds: for rrsig in &ds_rrsigs {
+                    for key in parent_keys {
+                        if key.key_tag_matches(rrsig.key_tag())
+                            && Self::verify_rrsig(rrsig, key, zone, &ds_full_records)
+                        {
+                            ds_verified = true;
+                            break 'ds;
+                        }
+                    }
+                }
+                if !ds_verified {
+                    return ChainResult::Bogus;
+                }
+
+                let anchors: Vec<(u16, u8, Vec<u8>)> = ds_records
+                    .iter()
+                    .filter(|d| u8::from(d.digest_type()) == 2)
+                    .map(|d| (d.key_tag(), u8::from(d.algorithm()), d.digest().to_vec()))
+                    .collect();
+                if anchors.is_empty() {
+                    return ChainResult::Unsigned;
+                }
+                anchors
+            };
+
+            let mut matched_keys: Vec<DNSKEY> = Vec::new();
+            let mut checks = 0;
+            for cand in &candidates {
+                checks += 1;
+                if checks > MAX_SIG_CHECKS {
+                    break;
+                }
+                let cand_tag = compute_key_tag(cand).unwrap_or(u16::MAX);
+                let cand_alg = u8::from(cand.public_key().algorithm());
+                for (tag, alg, digest) in &trusted_ds {
+                    if *tag == cand_tag && *alg == cand_alg {
+                        let computed = compute_ds_digest_sha256(zone, cand);
+                        if &computed == digest {
+                            matched_keys.push(cand.clone());
+                        }
+                    }
+                }
+            }
+            if matched_keys.is_empty() {
+                if zone.is_root() {
+                    // A mismatch here means OUR hardcoded trust anchor
+                    // configuration is wrong or stale -- that's a bug on
+                    // our end, not evidence of an attack. Fail open to
+                    // Insecure (same as "can't validate", which is what
+                    // happened before this feature existed at all)
+                    // instead of Bogus, so a bad anchor value doesn't
+                    // SERVFAIL every signed domain on the internet.
+                    let seen: Vec<String> = candidates
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "tag={} alg={} digest={}",
+                                compute_key_tag(c).unwrap_or(u16::MAX),
+                                u8::from(c.public_key().algorithm()),
+                                to_hex(&compute_ds_digest_sha256(zone, c))
+                            )
+                        })
+                        .collect();
+                    let expected: Vec<String> = trusted_ds
+                        .iter()
+                        .map(|(tag, alg, digest)| format!("tag={} alg={} digest={}", tag, alg, to_hex(digest)))
+                        .collect();
+                    tracing::error!(
+                        seen_root_keys = ?seen,
+                        expected_anchors = ?expected,
+                        "[DNSSEC] Root trust anchor mismatch -- treating as Insecure instead of \
+                         Bogus. This is a code/config bug, please report the seen/expected values."
+                    );
+                    return ChainResult::Unsigned;
+                }
+                tracing::warn!(zone = %zone, "[DNSSEC] Parent DS matches no published DNSKEY; returning Bogus");
+                return ChainResult::Bogus;
+            }
+
+            let dnskey_full_records: Vec<Record> = dnskey_msg
+                .answers()
+                .iter()
+                .filter(|r| r.record_type() == RecordType::DNSKEY && r.name() == zone)
+                .cloned()
+                .collect();
+
+            let mut dnskey_verified = false;
+            'dk: for rrsig in &dnskey_rrsigs {
+                for key in &matched_keys {
+                    if key.key_tag_matches(rrsig.key_tag())
+                        && Self::verify_rrsig(rrsig, key, zone, &dnskey_full_records)
+                    {
+                        dnskey_verified = true;
+                        break 'dk;
+                    }
+                }
+            }
+            if !dnskey_verified {
+                if zone.is_root() {
+                    tracing::error!(
+                        "[DNSSEC] Root DNSKEY RRset signature did not verify against a \
+                         trust-anchor-matched key -- treating as Insecure instead of Bogus \
+                         while this is debugged."
+                    );
+                    return ChainResult::Unsigned;
+                }
+                tracing::warn!(zone = %zone, "[DNSSEC] DNSKEY RRset signature did not verify; returning Bogus");
+                return ChainResult::Bogus;
+            }
+
+            let ttl = calculate_min_ttl(&dnskey_msg);
+            cache.insert(
+                zone_key,
+                CachedZoneKeys {
+                    keys: candidates.clone(),
+                    expires_at: now_secs() + ttl as u64,
+                },
+            );
+
+            trusted_parent_keys = Some(candidates);
+        }
+
+        match trusted_parent_keys {
+            Some(keys) => ChainResult::Trusted(keys),
+            None => ChainResult::Unsigned,
+        }
     }
 
     fn verify_rrsig(rrsig: &RRSIG, dnskey: &DNSKEY, owner: &Name, records: &[Record]) -> bool {
@@ -170,6 +422,33 @@ fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
     }
     ac += (ac >> 16) & 0xFFFF;
     Some((ac & 0xFFFF) as u16)
+}
+
+fn compute_ds_digest_sha256(owner: &Name, dnskey: &DNSKEY) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = BinEncoder::new(&mut buf);
+        encoder.set_canonical_names(true);
+        let _ = owner.emit(&mut encoder);
+    }
+    {
+        let mut encoder = BinEncoder::new(&mut buf);
+        let _ = dnskey.emit(&mut encoder);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    hasher.finalize().to_vec()
+}
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .filter_map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .collect()
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>> {

@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashSet;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,78 @@ struct DelegationEntry {
 
 pub struct RecursiveResolver {
     delegation_cache: DashMap<String, DelegationEntry>,
+}
+
+/// SECURITY: rejects IP addresses that must never be treated as a candidate
+/// upstream nameserver, whether they arrive as delegation glue (additionals)
+/// or as the result of resolving an NS hostname's own A/AAAA record.
+///
+/// Without this check, anyone who controls the NS delegation for a domain
+/// (i.e. anyone who owns a domain) can hand this resolver glue records that
+/// point at 127.0.0.1, a cloud metadata endpoint (169.254.169.254), or an
+/// internal RFC1918 address, and the resolver will happily open a socket and
+/// send it a DNS query. That's a confused-deputy / reflection primitive: the
+/// attacker picks the target, this server does the sending.
+fn is_safe_upstream_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+            {
+                return false;
+            }
+            let o = v4.octets();
+            // 100.64.0.0/10 - Carrier-Grade NAT (RFC 6598)
+            if o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000 {
+                return false;
+            }
+            // 198.18.0.0/15 - benchmarking (RFC 2544)
+            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+                return false;
+            }
+            // 0.0.0.0/8 - "this network"
+            if o[0] == 0 {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let seg0 = v6.segments()[0];
+            // fc00::/7 - unique local addresses
+            if (seg0 & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // fe80::/10 - link-local
+            if (seg0 & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // ::ffff:0:0/96 - IPv4-mapped; unwrap and re-check as v4
+            let seg = v6.segments();
+            if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xffff {
+                let mapped = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return is_safe_upstream_ip(IpAddr::V4(mapped));
+            }
+            true
+        }
+    }
+}
+
+fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let filtered: Vec<IpAddr> = ips.into_iter().filter(|ip| is_safe_upstream_ip(*ip)).collect();
+    filtered
 }
 
 impl RecursiveResolver {
@@ -229,6 +301,19 @@ impl RecursiveResolver {
                     }
                 }
 
+                // SECURITY: strip any glue that points at loopback/private/link-local/
+                // metadata-service ranges before we ever consider it. See
+                // is_safe_upstream_ip() for the full rationale.
+                let dropped_glue = next_ips.len();
+                next_ips = filter_safe_ips(next_ips);
+                if next_ips.len() != dropped_glue {
+                    tracing::warn!(
+                        zone = %active_delegation,
+                        dropped = dropped_glue - next_ips.len(),
+                        "[SECURITY] Dropped unsafe glue IP(s) in delegation (possible SSRF/reflection attempt)"
+                    );
+                }
+
                 // If glue was omitted, iteratively resolve nameserver IPs
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
@@ -241,7 +326,15 @@ impl RecursiveResolver {
                             {
                                 for ans in ns_resp.answers() {
                                     if let RData::A(a) = ans.data() {
-                                        next_ips.push(IpAddr::V4(a.0));
+                                        if is_safe_upstream_ip(IpAddr::V4(a.0)) {
+                                            next_ips.push(IpAddr::V4(a.0));
+                                        } else {
+                                            tracing::warn!(
+                                                ns = %ns_name,
+                                                ip = %a.0,
+                                                "[SECURITY] Dropped unsafe resolved NS IP (possible SSRF/reflection attempt)"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -348,6 +441,13 @@ impl RecursiveResolver {
         name: &Name,
         rtype: RecordType,
     ) -> Result<Message, RecursorError> {
+        // Defense in depth: even though callers should only ever hand us
+        // pre-filtered addresses, refuse to dial an unsafe IP here too.
+        if !is_safe_upstream_ip(addr.ip()) {
+            tracing::warn!(ip = %addr.ip(), "[SECURITY] Refused to query unsafe upstream IP");
+            return Err(RecursorError::AllNameserversFailed);
+        }
+
         let txid: u16 = rand::thread_rng().gen();
 
         let mut query_msg = Message::new();
