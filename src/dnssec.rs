@@ -976,7 +976,25 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         let key = cur.to_string().to_lowercase();
         if let Some(entry) = cache.get(&key) {
             if entry.expires_at > now_secs() {
-                return entry.signedness;
+                match entry.signedness {
+                    // ProvenUnsigned CAN be inherited down to subdomains
+                    ZoneSignedness::ProvenUnsigned => return ZoneSignedness::ProvenUnsigned,
+
+                    // Signed CANNOT be inherited from root ('.') or TLDs ('.com')!
+                    ZoneSignedness::Signed => {
+                        // In hickory-proto: root has 1 label (""), a TLD like "com." has 2 labels ("com", "")
+                        if cur.is_root() || cur.num_labels() <= 2 {
+                            if cur == *name {
+                                return ZoneSignedness::Signed;
+                            }
+                            // Do NOT inherit Signed from '.' or a TLD downwards!
+                        } else {
+                            return ZoneSignedness::Signed;
+                        }
+                    }
+
+                    ZoneSignedness::Unknown => {}
+                }
             }
         }
         if cur.is_root() {

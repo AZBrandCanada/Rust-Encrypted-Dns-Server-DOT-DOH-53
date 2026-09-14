@@ -224,8 +224,12 @@ async fn bind_tcp(host: &str, preferred: u16, fallback: u16) -> Result<(TcpListe
         Err(e) => Err(e),
     }
 }
-
-async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, domains: Vec<String>, concurrency: usize) {
+async fn preload_domains(
+    cache: DnsCache,
+    recursor: Arc<RecursiveResolver>,
+    domains: Vec<String>,
+    concurrency: usize,
+) {
     let total_domains = domains.len();
     if total_domains == 0 {
         return;
@@ -257,25 +261,42 @@ async fn preload_domains(cache: DnsCache, recursor: Arc<RecursiveResolver>, doma
                     if cache_ref.contains_key(&cache_key) {
                         continue;
                     }
+
                     if let Ok(mut msg) = recursor_ref.resolve(&name, qtype).await {
                         if matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain) {
-                            if !msg.answers().is_empty() {
-                                let all_records: Vec<_> = msg.answers().to_vec();
-                                let status = dnssec::DnssecValidator::validate_answer(
-                                    &recursor_ref,
-                                    &name,
-                                    qtype,
-                                    &all_records,
-                                )
-                                .await;
-                                msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
+                            // Validate DNSSEC (both positive answers and negative NODATA/NXDomain)
+                            let status = dnssec::DnssecValidator::validate_message(
+                                &recursor_ref,
+                                &msg,
+                                &name,
+                                qtype,
+                            )
+                            .await;
+
+                            // 1. DO NOT cache Bogus records!
+                            if status == dnssec::DnssecStatus::Bogus {
+                                continue;
                             }
+
+                            // 2. DO NOT cache InsecureUnknown records!
+                            if status == dnssec::DnssecStatus::InsecureUnknown {
+                                continue;
+                            }
+
+                            // 3. Mark AD flag if Secure
+                            msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
+
                             if let Ok(wire) = msg.to_bytes() {
                                 let ttl = calculate_min_ttl(&msg);
                                 let now = now_secs();
                                 cache_ref.insert(
                                     cache_key,
-                                    CacheEntry { raw_wire: wire, min_ttl: ttl, cached_at: now, last_revalidated_at: now },
+                                    CacheEntry {
+                                        raw_wire: wire,
+                                        min_ttl: ttl,
+                                        cached_at: now,
+                                        last_revalidated_at: now,
+                                    },
                                 );
                                 warmed_ref.fetch_add(1, Ordering::Relaxed);
                             }
