@@ -604,7 +604,7 @@ impl DnssecValidator {
         DnssecStatus::Secure
     }
 
-    async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> ChainResult {
+async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> ChainResult {
         let mut path = Vec::new();
         let mut cur = target_zone.clone();
         loop {
@@ -622,6 +622,7 @@ impl DnssecValidator {
         for zone in &path {
             let zone_key = zone.to_string().to_lowercase();
 
+            // 1. Check cache first
             if let Some(cached) = cache.get(&zone_key) {
                 if cached.expires_at > now_secs() {
                     trusted_parent_keys = Some(cached.keys.clone());
@@ -629,56 +630,7 @@ impl DnssecValidator {
                 }
             }
 
-            let dnskey_msg = match recursor.resolve(zone, RecordType::DNSKEY).await {
-                Ok(m) => m,
-                Err(err) => {
-                    tracing::warn!(
-                        zone = %zone,
-                        error = %err,
-                        "[DNSSEC] Failed to fetch DNSKEY; Bogus (fail-closed)"
-                    );
-                    return ChainResult::Bogus;
-                }
-            };
-
-            let candidates: Vec<DNSKEY> = dnskey_msg
-                .answers()
-                .iter()
-                .filter(|r| r.name() == zone)
-                .filter_map(|r| match r.data() {
-                    RData::DNSSEC(DNSSECRData::DNSKEY(k)) => Some(k.clone()),
-                    _ => None,
-                })
-                .collect();
-            if candidates.is_empty() {
-                tracing::warn!(
-                    zone = %zone,
-                    "[DNSSEC] DNSKEY query returned no keys for a signer \
-                     zone; Bogus (fail-closed)"
-                );
-                return ChainResult::Bogus;
-            }
-
-            let dnskey_rrsigs: Vec<RRSIG> = dnskey_msg
-                .answers()
-                .iter()
-                .filter_map(|r| match r.data() {
-                    RData::DNSSEC(DNSSECRData::RRSIG(s))
-                        if s.type_covered() == RecordType::DNSKEY =>
-                    {
-                        Some(s.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if dnskey_rrsigs.is_empty() {
-                tracing::warn!(
-                    zone = %zone,
-                    "[DNSSEC] DNSKEY RRset has no RRSIG; Bogus (fail-closed)"
-                );
-                return ChainResult::Bogus;
-            }
-
+            // 2. Determine trusted DS anchors for this zone
             let trusted_ds: Vec<(u16, u8, u8, Vec<u8>)> = if zone.is_root() {
                 ROOT_TRUST_ANCHORS
                     .iter()
@@ -698,6 +650,7 @@ impl DnssecValidator {
                     }
                 };
 
+                // Query parent for DS record FIRST
                 let ds_msg = match recursor.resolve(zone, RecordType::DS).await {
                     Ok(m) => m,
                     Err(err) => {
@@ -719,6 +672,8 @@ impl DnssecValidator {
                         _ => None,
                     })
                     .collect();
+
+                // ---> CRUCIAL FIX: If no DS at parent, this zone is unsigned! <---
                 if ds_records.is_empty() {
                     tracing::debug!(
                         zone = %zone,
@@ -739,6 +694,7 @@ impl DnssecValidator {
                         _ => None,
                     })
                     .collect();
+
                 if ds_rrsigs.is_empty() {
                     tracing::warn!(
                         zone = %zone,
@@ -789,6 +745,7 @@ impl DnssecValidator {
                         }
                     })
                     .collect();
+
                 if anchors.is_empty() {
                     tracing::warn!(
                         zone = %zone,
@@ -796,8 +753,61 @@ impl DnssecValidator {
                     );
                     return ChainResult::Unsigned;
                 }
+
                 anchors
             };
+
+            // 3. NOW fetch DNSKEY (we know the zone is signed because a valid DS exists)
+            let dnskey_msg = match recursor.resolve(zone, RecordType::DNSKEY).await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(
+                        zone = %zone,
+                        error = %err,
+                        "[DNSSEC] Failed to fetch DNSKEY; Bogus (fail-closed)"
+                    );
+                    return ChainResult::Bogus;
+                }
+            };
+
+            let candidates: Vec<DNSKEY> = dnskey_msg
+                .answers()
+                .iter()
+                .filter(|r| r.name() == zone)
+                .filter_map(|r| match r.data() {
+                    RData::DNSSEC(DNSSECRData::DNSKEY(k)) => Some(k.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] DNSKEY query returned no keys for a signed zone; Bogus (fail-closed)"
+                );
+                return ChainResult::Bogus;
+            }
+
+            let dnskey_rrsigs: Vec<RRSIG> = dnskey_msg
+                .answers()
+                .iter()
+                .filter_map(|r| match r.data() {
+                    RData::DNSSEC(DNSSECRData::RRSIG(s))
+                        if s.type_covered() == RecordType::DNSKEY =>
+                    {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if dnskey_rrsigs.is_empty() {
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] DNSKEY RRset has no RRSIG; Bogus (fail-closed)"
+                );
+                return ChainResult::Bogus;
+            }
 
             let mut matched_keys: Vec<DNSKEY> = Vec::new();
             let mut checks = 0;
@@ -818,38 +828,8 @@ impl DnssecValidator {
                     }
                 }
             }
+
             if matched_keys.is_empty() {
-                if zone.is_root() {
-                    let seen: Vec<String> = candidates
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "tag={} alg={} digest_sha256={}",
-                                compute_key_tag(c).unwrap_or(u16::MAX),
-                                u8::from(c.public_key().algorithm()),
-                                to_hex(&compute_ds_digest(zone, c, 2).unwrap_or_default())
-                            )
-                        })
-                        .collect();
-                    let expected: Vec<String> = trusted_ds
-                        .iter()
-                        .map(|(tag, alg, dt, digest)| {
-                            format!(
-                                "tag={} alg={} digest_type={} digest={}",
-                                tag,
-                                alg,
-                                dt,
-                                to_hex(digest)
-                            )
-                        })
-                        .collect();
-                    tracing::error!(
-                        seen_root_keys = ?seen,
-                        expected_anchors = ?expected,
-                        "[DNSSEC] Root trust anchor mismatch; Bogus (fail-closed)"
-                    );
-                    return ChainResult::Bogus;
-                }
                 tracing::warn!(
                     zone = %zone,
                     "[DNSSEC] Parent DS matches no published DNSKEY; returning Bogus"
@@ -875,14 +855,8 @@ impl DnssecValidator {
                     }
                 }
             }
+
             if !dnskey_verified {
-                if zone.is_root() {
-                    tracing::error!(
-                        "[DNSSEC] Root DNSKEY RRset signature did not verify against a \
-                         trust-anchor-matched key; Bogus (fail-closed)"
-                    );
-                    return ChainResult::Bogus;
-                }
                 tracing::warn!(
                     zone = %zone,
                     "[DNSSEC] DNSKEY RRset signature did not verify; returning Bogus"
@@ -904,13 +878,7 @@ impl DnssecValidator {
 
         match trusted_parent_keys {
             Some(keys) => ChainResult::Trusted(keys),
-            None => {
-                tracing::warn!(
-                    target = %target_zone,
-                    "[DNSSEC] Trust chain walk produced no keys; Unsigned"
-                );
-                ChainResult::Unsigned
-            }
+            None => ChainResult::Unsigned,
         }
     }
 
