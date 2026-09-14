@@ -6,16 +6,16 @@ use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, Nsec3HashAlgorithm, PublicKey};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use ring::digest;
-use ring::signature;
-use sha2::{Digest, Sha256};
-use std::str::FromStr;
-use std::sync::OnceLock;
+use ml_dsa::signature::Verifier;
 use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
     VerifyingKey as MlDsaVerifyingKey,
 };
-use ml_dsa::signature::Verifier;
+use ring::digest;
+use ring::signature;
+use sha2::{Digest, Sha256, Sha384};
+use std::str::FromStr;
+use std::sync::OnceLock;
 
 const MAX_SIG_CHECKS: usize = 8;               // KeyTrap (CVE-2023-50387)
 const MAX_NEGATIVE_RECORDS: usize = 8;         // cap NSEC/NSEC3 records processed
@@ -564,10 +564,13 @@ impl DnssecValidator {
                 return ChainResult::Unsigned;
             }
 
-            let trusted_ds: Vec<(u16, u8, Vec<u8>)> = if zone.is_root() {
+            // trusted_ds: (key_tag, algorithm, digest_type, digest_bytes)
+            let trusted_ds: Vec<(u16, u8, u8, Vec<u8>)> = if zone.is_root() {
                 ROOT_TRUST_ANCHORS
                     .iter()
-                    .map(|(tag, alg, _digest_type, hex)| (*tag, *alg, hex_decode(hex)))
+                    .map(|(tag, alg, digest_type, hex)| {
+                        (*tag, *alg, *digest_type, hex_decode(hex))
+                    })
                     .collect()
             } else {
                 let parent_keys = match &trusted_parent_keys {
@@ -656,15 +659,30 @@ impl DnssecValidator {
                     return ChainResult::Bogus;
                 }
 
-                let anchors: Vec<(u16, u8, Vec<u8>)> = ds_records
+                // RFC 4509: digest type 2 = SHA-256 (used with RSA and Ed25519)
+                // RFC 6605: digest type 4 = SHA-384 (required for ECDSA P-384)
+                // We accept both; digest types 1 (SHA-1) and 3 (GOST) are
+                // obsolete and intentionally rejected.
+                let anchors: Vec<(u16, u8, u8, Vec<u8>)> = ds_records
                     .iter()
-                    .filter(|d| u8::from(d.digest_type()) == 2)
-                    .map(|d| (d.key_tag(), u8::from(d.algorithm()), d.digest().to_vec()))
+                    .filter_map(|d| {
+                        let dt = u8::from(d.digest_type());
+                        if dt == 2 || dt == 4 {
+                            Some((
+                                d.key_tag(),
+                                u8::from(d.algorithm()),
+                                dt,
+                                d.digest().to_vec(),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 if anchors.is_empty() {
                     tracing::warn!(
                         zone = %zone,
-                        "[DNSSEC] DS RRset has no SHA-256 digests; returning Unsigned"
+                        "[DNSSEC] DS RRset has no SHA-256 or SHA-384 digests; returning Unsigned"
                     );
                     return ChainResult::Unsigned;
                 }
@@ -680,11 +698,12 @@ impl DnssecValidator {
                 }
                 let cand_tag = compute_key_tag(cand).unwrap_or(u16::MAX);
                 let cand_alg = u8::from(cand.public_key().algorithm());
-                for (tag, alg, digest) in &trusted_ds {
+                for (tag, alg, digest_type, digest) in &trusted_ds {
                     if *tag == cand_tag && *alg == cand_alg {
-                        let computed = compute_ds_digest_sha256(zone, cand);
-                        if &computed == digest {
-                            matched_keys.push(cand.clone());
+                        if let Some(computed) = compute_ds_digest(zone, cand, *digest_type) {
+                            if &computed == digest {
+                                matched_keys.push(cand.clone());
+                            }
                         }
                     }
                 }
@@ -695,17 +714,23 @@ impl DnssecValidator {
                         .iter()
                         .map(|c| {
                             format!(
-                                "tag={} alg={} digest={}",
+                                "tag={} alg={} digest_sha256={}",
                                 compute_key_tag(c).unwrap_or(u16::MAX),
                                 u8::from(c.public_key().algorithm()),
-                                to_hex(&compute_ds_digest_sha256(zone, c))
+                                to_hex(&compute_ds_digest(zone, c, 2).unwrap_or_default())
                             )
                         })
                         .collect();
                     let expected: Vec<String> = trusted_ds
                         .iter()
-                        .map(|(tag, alg, digest)| {
-                            format!("tag={} alg={} digest={}", tag, alg, to_hex(digest))
+                        .map(|(tag, alg, dt, digest)| {
+                            format!(
+                                "tag={} alg={} digest_type={} digest={}",
+                                tag,
+                                alg,
+                                dt,
+                                to_hex(digest)
+                            )
                         })
                         .collect();
                     tracing::error!(
@@ -947,13 +972,17 @@ fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
 }
 
 /// RFC 4034 §5.1.4:
-///   digest = SHA-256( owner_name_wire || DNSKEY_RDATA )
+///   digest = HASH( owner_name_wire || DNSKEY_RDATA )
 ///
 /// Both owner and DNSKEY must be emitted into the SAME encoder so the
 /// write offset advances monotonically. Creating a second
 /// `BinEncoder::new(&mut buf)` resets the offset to 0 and overwrites the
 /// owner bytes.
-fn compute_ds_digest_sha256(owner: &Name, dnskey: &DNSKEY) -> Vec<u8> {
+///
+/// `digest_type`:
+///   2 = SHA-256 (RFC 4509) -- used with RSA and Ed25519
+///   4 = SHA-384 (RFC 6605) -- required for ECDSA P-384
+fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut encoder = BinEncoder::new(&mut buf);
@@ -961,9 +990,11 @@ fn compute_ds_digest_sha256(owner: &Name, dnskey: &DNSKEY) -> Vec<u8> {
         let _ = owner.emit(&mut encoder);
         let _ = dnskey.emit(&mut encoder);
     }
-    let mut hasher = Sha256::new();
-    hasher.update(&buf);
-    hasher.finalize().to_vec()
+    match digest_type {
+        2 => Some(Sha256::digest(&buf).to_vec()),
+        4 => Some(Sha384::digest(&buf).to_vec()),
+        _ => None,
+    }
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
@@ -1109,16 +1140,6 @@ fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], s
 /// `PublicKey` abstraction does not know about algorithm 18, so
 /// `dnskey.public_key().verify(...)` would always fail for these zones.
 /// We bypass it entirely and hand the raw bytes to the `ml-dsa` crate.
-/// ML-DSA-44 (DNSSEC Algorithm 18).
-///
-/// Sizes per FIPS 204 / draft-ietf-dnsop-ml-dsa-dnssec:
-///   * public key: 1,312 bytes
-///   * signature:  2,420 bytes
-///
-/// Both are pulled raw from the DNSKEY/RRSIG records. hickory-proto's
-/// `PublicKey` abstraction does not know about algorithm 18, so
-/// `dnskey.public_key().verify(...)` would always fail for these zones.
-/// We bypass it entirely and hand the raw bytes to the `ml-dsa` crate.
 fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
     let Ok(vk_enc) = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes) else {
         tracing::debug!(
@@ -1145,6 +1166,7 @@ fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
 
     vk.verify(message, &sig_obj).is_ok()
 }
+
 fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     if bytes.is_empty() {
         return None;
@@ -1158,7 +1180,7 @@ fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     } else {
         (bytes[0] as usize, &bytes[1..])
     };
-if rest.len() < exp_len {
+    if rest.len() < exp_len {
         return None;
     }
     let (exponent, modulus) = rest.split_at(exp_len);
