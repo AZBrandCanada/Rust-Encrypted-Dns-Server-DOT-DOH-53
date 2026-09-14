@@ -168,9 +168,8 @@ impl RecursiveResolver {
             }
 
             let start_ips = self
-                .find_cached_start(name)
+                .find_cached_start(name, rtype)
                 .unwrap_or_else(|| ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect());
-
             let mut current_servers: Vec<SocketAddr> =
                 start_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
             current_servers.shuffle(&mut rand::thread_rng());
@@ -369,9 +368,19 @@ impl RecursiveResolver {
         })
     }
 
-    fn find_cached_start(&self, name: &Name) -> Option<Vec<IpAddr>> {
+    fn find_cached_start(&self, name: &Name, rtype: RecordType) -> Option<Vec<IpAddr>> {
         let now = now_secs();
-        let mut current = name.clone();
+        // A DS RRset is authoritative at the *parent* of the child zone, so
+        // for DS queries the delegation cache must be searched starting at
+        // the parent name, not at the name itself.  Without this, asking for
+        // `DS com.` would return the `com.` servers instead of the root, and
+        // the `com.` servers would (correctly) respond NODATA -- making every
+        // signed TLD look unsigned.
+        let mut current = if rtype == RecordType::DS {
+            name.base_name()
+        } else {
+            name.clone()
+        };
         loop {
             let key = current.to_string().to_lowercase();
             if let Some(entry) = self.delegation_cache.get(&key) {
@@ -386,7 +395,6 @@ impl RecursiveResolver {
         }
         None
     }
-
     async fn query_servers_with_fallback(
         servers: &[SocketAddr],
         name: &Name,

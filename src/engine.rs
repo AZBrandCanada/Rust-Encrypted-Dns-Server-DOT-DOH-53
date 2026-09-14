@@ -23,6 +23,45 @@ fn is_cacheable(msg: &Message) -> bool {
     matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain)
 }
 
+/// Normalize the flags on a fresh response Message destined for a recursive
+/// client:
+///   * AA must be cleared (we are not authoritative)
+///   * RA must be set (we do offer recursion)
+///   * RD must echo the client's RD
+///   * CD must echo the client's CD
+///   * AD is set by the caller based on the DNSSEC verdict
+fn normalize_response_flags(resp: &mut Message, req: &Message, ad: bool) {
+    resp.set_authoritative(false);
+    resp.set_recursion_available(true);
+    resp.set_recursion_desired(req.recursion_desired());
+    resp.set_checking_disabled(req.checking_disabled());
+    resp.set_authentic_data(ad);
+}
+
+/// Rewrite the flags of an already-encoded wire response so that it is
+/// suitable for the given client.  Preserves RCODE and the resolver's AD
+/// verdict; clears AA; sets RA; echoes RD and CD from the request; rewrites
+/// the transaction ID.
+fn normalize_cached_wire(wire: &mut [u8], req_wire: &[u8]) {
+    if wire.len() < 4 || req_wire.len() < 4 {
+        return;
+    }
+    // Transaction ID
+    wire[0] = req_wire[0];
+    wire[1] = req_wire[1];
+
+    let client_flags = u16::from_be_bytes([req_wire[2], req_wire[3]]);
+    let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
+
+    flags &= !0x0400;                                     // clear AA  (bit 10)
+    flags |= 0x0080;                                      // set RA    (bit 7)
+    flags = (flags & !0x0100) | (client_flags & 0x0100);  // echo RD   (bit 8)
+    flags = (flags & !0x0010) | (client_flags & 0x0010);  // echo CD   (bit 4)
+
+    wire[2] = (flags >> 8) as u8;
+    wire[3] = (flags & 0xff) as u8;
+}
+
 pub async fn process_dns_wire(
     req_wire: &[u8],
     state: &AppState,
@@ -103,12 +142,6 @@ pub async fn process_dns_wire(
                     if let Ok(mut fresh_msg) =
                         recursor_clone.resolve(&name_clone, qtype).await
                     {
-                        // Validate the fresh response.  For a signed zone,
-                        // this either confirms AD=1 (Secure), clears AD
-                        // (Insecure / unsigned zone), or rejects the
-                        // response entirely (Bogus).  Negative responses
-                        // (NXDOMAIN / NODATA) go through the NSEC/NSEC3
-                        // proof path via validate_message.
                         let status = DnssecValidator::validate_message(
                             &recursor_clone,
                             &fresh_msg,
@@ -125,14 +158,6 @@ pub async fn process_dns_wire(
                                 fresh_msg.set_authentic_data(false);
                             }
                             DnssecStatus::Bogus => {
-                                // Do NOT overwrite a previously-good cache
-                                // entry with a Bogus verdict from a fresh
-                                // resolution.  The upstream we hit may be
-                                // under attack, misconfigured, or simply
-                                // flaky; keeping the old entry bounds the
-                                // blast radius of a transient failure and
-                                // prevents a race-winner from poisoning
-                                // a name we already had correct.
                                 tracing::warn!(
                                     domain = %name_clone,
                                     rtype = %qtype,
@@ -145,6 +170,11 @@ pub async fn process_dns_wire(
                         }
 
                         if is_cacheable(&fresh_msg) {
+                            // Normalize flags before caching, so that
+                            // every cache read serves a correctly shaped
+                            // response.
+                            fresh_msg.set_authoritative(false);
+                            fresh_msg.set_recursion_available(true);
                             if let Ok(wire) = fresh_msg.to_bytes() {
                                 let ttl = calculate_min_ttl(&fresh_msg);
                                 let cur_time = now_secs();
@@ -179,10 +209,7 @@ pub async fn process_dns_wire(
         }
 
         let mut wire = entry.raw_wire.clone();
-        if wire.len() >= 2 && req_wire.len() >= 2 {
-            wire[0] = req_wire[0];
-            wire[1] = req_wire[1];
-        }
+        normalize_cached_wire(&mut wire, req_wire);
         return wire;
     }
 
@@ -191,17 +218,6 @@ pub async fn process_dns_wire(
     // ---------------------------------------------------------------------
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
-            // Validate the full message.  This dispatches on whether the
-            // answer section is empty:
-            //
-            //   * Positive answers  -> RRSIG on the RRset, chain to root.
-            //   * NXDOMAIN / NODATA -> NSEC or NSEC3 denial-of-existence
-            //                          proof validated against the zone
-            //                          keys.
-            //
-            // Prior to this change, negative responses skipped validation
-            // entirely: a forged NXDOMAIN from an on-path attacker (or a
-            // compromised authoritative server) was accepted and cached.
             let dnssec_status = DnssecValidator::validate_message(
                 &state.recursor,
                 &resp_msg,
@@ -210,13 +226,9 @@ pub async fn process_dns_wire(
             )
             .await;
 
-            match dnssec_status {
-                DnssecStatus::Secure => {
-                    resp_msg.set_authentic_data(true);
-                }
-                DnssecStatus::Insecure => {
-                    resp_msg.set_authentic_data(false);
-                }
+            let ad = match dnssec_status {
+                DnssecStatus::Secure => true,
+                DnssecStatus::Insecure => false,
                 DnssecStatus::Bogus => {
                     if state.dnssec_enforce {
                         tracing::warn!(
@@ -229,14 +241,24 @@ pub async fn process_dns_wire(
                         );
                         return make_servfail_wire(req_msg.id(), Some(query));
                     }
-                    // Enforcement disabled: surface the answer but
-                    // explicitly downgrade the AD bit so downstream
-                    // validators know we did not confirm it.
-                    resp_msg.set_authentic_data(false);
+                    tracing::warn!(
+                        protocol,
+                        client = %client_ip,
+                        domain = %qname,
+                        rtype = %qtype,
+                        "[DNSSEC] Bogus DNSSEC proof; enforcement disabled, \
+                         serving with AD=0"
+                    );
+                    false
                 }
-            }
+            };
 
+            // Normalize the response for the client BEFORE we cache or
+            // return it.  This clears the upstream AA bit, sets RA, and
+            // echoes RD/CD from the client request.
+            normalize_response_flags(&mut resp_msg, &req_msg, ad);
             resp_msg.set_id(req_msg.id());
+
             let wire = match resp_msg.to_bytes() {
                 Ok(w) => w,
                 Err(_) => return make_servfail_wire(req_msg.id(), Some(query)),
@@ -295,6 +317,7 @@ pub fn make_truncated_wire(id: u16, query: Option<&hickory_proto::op::Query>) ->
     msg.set_message_type(MessageType::Response);
     msg.set_truncated(true);
     msg.set_recursion_available(true);
+    msg.set_authoritative(false);
     if let Some(q) = query {
         msg.add_query(q.clone());
     }
@@ -306,6 +329,8 @@ pub fn make_servfail_wire(id: u16, query: Option<&hickory_proto::op::Query>) -> 
     msg.set_id(id);
     msg.set_message_type(MessageType::Response);
     msg.set_response_code(ResponseCode::ServFail);
+    msg.set_recursion_available(true);
+    msg.set_authoritative(false);
     if let Some(q) = query {
         msg.add_query(q.clone());
     }

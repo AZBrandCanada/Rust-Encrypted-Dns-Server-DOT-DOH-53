@@ -11,6 +11,11 @@ use ring::signature;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use ml_dsa::{
+    EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
+    VerifyingKey as MlDsaVerifyingKey,
+};
+use ml_dsa::signature::Verifier;
 
 const MAX_SIG_CHECKS: usize = 8;               // KeyTrap (CVE-2023-50387)
 const MAX_NEGATIVE_RECORDS: usize = 8;         // cap NSEC/NSEC3 records processed
@@ -84,6 +89,11 @@ impl DnssecValidator {
             .cloned()
             .collect();
         if target_records.is_empty() {
+            tracing::debug!(
+                name = %name,
+                qtype = ?rtype,
+                "[DNSSEC] No records of requested type; treating as Insecure"
+            );
             return DnssecStatus::Insecure;
         }
 
@@ -100,6 +110,11 @@ impl DnssecValidator {
             .collect();
 
         if rrsigs.is_empty() {
+            tracing::debug!(
+                owner = %rrset_owner,
+                qtype = ?rtype,
+                "[DNSSEC] No RRSIG covering requested type; treating as Insecure"
+            );
             return DnssecStatus::Insecure;
         }
 
@@ -109,6 +124,13 @@ impl DnssecValidator {
             let exp = rrsig.sig_expiration().get() as u64;
             let inc = rrsig.sig_inception().get() as u64;
             if now > exp || now < inc {
+                tracing::debug!(
+                    owner = %rrset_owner,
+                    expiration = exp,
+                    inception = inc,
+                    now,
+                    "[DNSSEC] RRSIG outside validity window; Bogus"
+                );
                 return DnssecStatus::Bogus;
             }
         }
@@ -137,14 +159,34 @@ impl DnssecValidator {
                             );
                             return DnssecStatus::Bogus;
                         }
-                        if dnskey.key_tag_matches(rrsig.key_tag())
-                            && Self::verify_rrsig(rrsig, dnskey, &rrset_owner, &target_records)
-                        {
+
+                        let key_tag = compute_key_tag(dnskey).unwrap_or(u16::MAX);
+                        let tag_match = key_tag == rrsig.key_tag();
+                        let sig_ok = tag_match
+                            && Self::verify_rrsig(rrsig, dnskey, &rrset_owner, &target_records);
+
+                        tracing::debug!(
+                            owner = %rrset_owner,
+                            signer = %zone,
+                            rrsig_tag = rrsig.key_tag(),
+                            dnskey_tag = key_tag,
+                            tag_match,
+                            sig_ok,
+                            "[DNSSEC] RRSIG candidate check"
+                        );
+
+                        if sig_ok {
                             return DnssecStatus::Secure;
                         }
                     }
                 }
-                ChainResult::Unsigned => {}
+                ChainResult::Unsigned => {
+                    tracing::debug!(
+                        signer = %zone,
+                        owner = %rrset_owner,
+                        "[DNSSEC] Trust chain returned Unsigned for signer"
+                    );
+                }
                 ChainResult::Bogus => {
                     return DnssecStatus::Bogus;
                 }
@@ -155,6 +197,12 @@ impl DnssecValidator {
             return DnssecStatus::Bogus;
         }
 
+        tracing::warn!(
+            owner = %rrset_owner,
+            qtype = ?rtype,
+            rrsig_count = rrsigs.len(),
+            "[DNSSEC] Validation fell through all RRSIGs; returning Insecure"
+        );
         DnssecStatus::Insecure
     }
 
@@ -170,13 +218,33 @@ impl DnssecValidator {
             .find(|r| matches!(r.data(), RData::SOA(_)));
         let zone = match soa {
             Some(r) => r.name().clone(),
-            None => return DnssecStatus::Insecure,
+            None => {
+                tracing::debug!(
+                    qname = %qname,
+                    "[DNSSEC] Negative response has no SOA; treating as Insecure"
+                );
+                return DnssecStatus::Insecure;
+            }
         };
 
         let keys = match Self::build_trust_chain(recursor, &zone).await {
             ChainResult::Trusted(k) => k,
-            ChainResult::Unsigned => return DnssecStatus::Insecure,
-            ChainResult::Bogus => return DnssecStatus::Bogus,
+            ChainResult::Unsigned => {
+                tracing::debug!(
+                    zone = %zone,
+                    qname = %qname,
+                    "[DNSSEC] Negative: trust chain Unsigned; treating as Insecure"
+                );
+                return DnssecStatus::Insecure;
+            }
+            ChainResult::Bogus => {
+                tracing::warn!(
+                    zone = %zone,
+                    qname = %qname,
+                    "[DNSSEC] Negative: trust chain Bogus"
+                );
+                return DnssecStatus::Bogus;
+            }
         };
 
         let authority: Vec<Record> = msg.name_servers().to_vec();
@@ -195,6 +263,11 @@ impl DnssecValidator {
             return Self::validate_nsec(&keys, qname, qtype, &authority);
         }
 
+        tracing::warn!(
+            zone = %zone,
+            qname = %qname,
+            "[DNSSEC] Signed zone negative response has no NSEC/NSEC3 proof; Bogus"
+        );
         DnssecStatus::Bogus
     }
 
@@ -444,7 +517,14 @@ impl DnssecValidator {
 
             let dnskey_msg = match recursor.resolve(zone, RecordType::DNSKEY).await {
                 Ok(m) => m,
-                Err(_) => return ChainResult::Unsigned,
+                Err(err) => {
+                    tracing::warn!(
+                        zone = %zone,
+                        error = %err,
+                        "[DNSSEC] Failed to fetch DNSKEY; returning Unsigned"
+                    );
+                    return ChainResult::Unsigned;
+                }
             };
 
             let candidates: Vec<DNSKEY> = dnskey_msg
@@ -457,6 +537,10 @@ impl DnssecValidator {
                 })
                 .collect();
             if candidates.is_empty() {
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] DNSKEY query returned no keys; returning Unsigned"
+                );
                 return ChainResult::Unsigned;
             }
 
@@ -473,6 +557,10 @@ impl DnssecValidator {
                 })
                 .collect();
             if dnskey_rrsigs.is_empty() {
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] DNSKEY RRset has no RRSIG; returning Unsigned"
+                );
                 return ChainResult::Unsigned;
             }
 
@@ -484,12 +572,25 @@ impl DnssecValidator {
             } else {
                 let parent_keys = match &trusted_parent_keys {
                     Some(k) => k,
-                    None => return ChainResult::Bogus,
+                    None => {
+                        tracing::warn!(
+                            zone = %zone,
+                            "[DNSSEC] No trusted parent keys available; Bogus"
+                        );
+                        return ChainResult::Bogus;
+                    }
                 };
 
                 let ds_msg = match recursor.resolve(zone, RecordType::DS).await {
                     Ok(m) => m,
-                    Err(_) => return ChainResult::Unsigned,
+                    Err(err) => {
+                        tracing::warn!(
+                            zone = %zone,
+                            error = %err,
+                            "[DNSSEC] Failed to fetch DS; returning Unsigned"
+                        );
+                        return ChainResult::Unsigned;
+                    }
                 };
 
                 let ds_records: Vec<DS> = ds_msg
@@ -502,6 +603,10 @@ impl DnssecValidator {
                     })
                     .collect();
                 if ds_records.is_empty() {
+                    tracing::debug!(
+                        zone = %zone,
+                        "[DNSSEC] No DS at parent; zone is Insecure (unsigned delegation)"
+                    );
                     return ChainResult::Unsigned;
                 }
 
@@ -518,6 +623,10 @@ impl DnssecValidator {
                     })
                     .collect();
                 if ds_rrsigs.is_empty() {
+                    tracing::warn!(
+                        zone = %zone,
+                        "[DNSSEC] DS RRset has no RRSIG; Bogus"
+                    );
                     return ChainResult::Bogus;
                 }
 
@@ -540,6 +649,10 @@ impl DnssecValidator {
                     }
                 }
                 if !ds_verified {
+                    tracing::warn!(
+                        zone = %zone,
+                        "[DNSSEC] Parent DS signature did not verify; Bogus"
+                    );
                     return ChainResult::Bogus;
                 }
 
@@ -549,6 +662,10 @@ impl DnssecValidator {
                     .map(|d| (d.key_tag(), u8::from(d.algorithm()), d.digest().to_vec()))
                     .collect();
                 if anchors.is_empty() {
+                    tracing::warn!(
+                        zone = %zone,
+                        "[DNSSEC] DS RRset has no SHA-256 digests; returning Unsigned"
+                    );
                     return ChainResult::Unsigned;
                 }
                 anchors
@@ -599,7 +716,10 @@ impl DnssecValidator {
                     );
                     return ChainResult::Unsigned;
                 }
-                tracing::warn!(zone = %zone, "[DNSSEC] Parent DS matches no published DNSKEY; returning Bogus");
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] Parent DS matches no published DNSKEY; returning Bogus"
+                );
                 return ChainResult::Bogus;
             }
 
@@ -630,7 +750,10 @@ impl DnssecValidator {
                     );
                     return ChainResult::Unsigned;
                 }
-                tracing::warn!(zone = %zone, "[DNSSEC] DNSKEY RRset signature did not verify; returning Bogus");
+                tracing::warn!(
+                    zone = %zone,
+                    "[DNSSEC] DNSKEY RRset signature did not verify; returning Bogus"
+                );
                 return ChainResult::Bogus;
             }
 
@@ -648,14 +771,26 @@ impl DnssecValidator {
 
         match trusted_parent_keys {
             Some(keys) => ChainResult::Trusted(keys),
-            None => ChainResult::Unsigned,
+            None => {
+                tracing::warn!(
+                    target = %target_zone,
+                    "[DNSSEC] Trust chain walk produced no keys; Unsigned"
+                );
+                ChainResult::Unsigned
+            }
         }
     }
 
     fn verify_rrsig(rrsig: &RRSIG, dnskey: &DNSKEY, owner: &Name, records: &[Record]) -> bool {
         let tbs = match build_tbs(rrsig, owner, records) {
             Some(t) => t,
-            None => return false,
+            None => {
+                tracing::debug!(
+                    owner = %owner,
+                    "[DNSSEC] Failed to build TBS for RRSIG"
+                );
+                return false;
+            }
         };
 
         if verify_signature(
@@ -817,8 +952,7 @@ fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
 /// Both owner and DNSKEY must be emitted into the SAME encoder so the
 /// write offset advances monotonically. Creating a second
 /// `BinEncoder::new(&mut buf)` resets the offset to 0 and overwrites the
-/// owner bytes -- which produces a digest that never matches any
-/// published trust anchor.
+/// owner bytes.
 fn compute_ds_digest_sha256(owner: &Name, dnskey: &DNSKEY) -> Vec<u8> {
     let mut buf = Vec::new();
     {
@@ -894,9 +1028,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
         }
 
         // Full canonical RR: owner | type | class | orig_ttl | rdlength | rdata
-        // All emits share ONE encoder, which is fine because they all
-        // append (the offset advances monotonically and no second encoder
-        // is created over an already-populated buffer).
         let mut full_buf = Vec::new();
         {
             let mut encoder = BinEncoder::new(&mut full_buf);
@@ -924,6 +1055,7 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
 
     Some(out)
 }
+
 fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
     match algorithm {
         Algorithm::RSASHA256 | Algorithm::RSASHA512 => {
@@ -962,10 +1094,57 @@ fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], s
             let key = signature::UnparsedPublicKey::new(&signature::ED25519, pubkey_bytes);
             key.verify(message, sig).is_ok()
         }
+        Algorithm::Unknown(18) => verify_mldsa44(pubkey_bytes, message, sig),
         _ => false,
     }
 }
 
+/// ML-DSA-44 (DNSSEC Algorithm 18).
+///
+/// Sizes per FIPS 204 / draft-ietf-dnsop-ml-dsa-dnssec:
+///   * public key: 1,312 bytes
+///   * signature:  2,420 bytes
+///
+/// Both are pulled raw from the DNSKEY/RRSIG records. hickory-proto's
+/// `PublicKey` abstraction does not know about algorithm 18, so
+/// `dnskey.public_key().verify(...)` would always fail for these zones.
+/// We bypass it entirely and hand the raw bytes to the `ml-dsa` crate.
+/// ML-DSA-44 (DNSSEC Algorithm 18).
+///
+/// Sizes per FIPS 204 / draft-ietf-dnsop-ml-dsa-dnssec:
+///   * public key: 1,312 bytes
+///   * signature:  2,420 bytes
+///
+/// Both are pulled raw from the DNSKEY/RRSIG records. hickory-proto's
+/// `PublicKey` abstraction does not know about algorithm 18, so
+/// `dnskey.public_key().verify(...)` would always fail for these zones.
+/// We bypass it entirely and hand the raw bytes to the `ml-dsa` crate.
+fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
+    let Ok(vk_enc) = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes) else {
+        tracing::debug!(
+            len = pubkey_bytes.len(),
+            "[DNSSEC] ML-DSA-44 public key has wrong length (expected 1312)"
+        );
+        return false;
+    };
+    // decode() is infallible: the encoded wrapper has already validated
+    // the fixed 1312-byte layout.
+    let vk = MlDsaVerifyingKey::<MlDsa44>::decode(&vk_enc);
+
+    let Ok(sig_enc) = EncodedSignature::<MlDsa44>::try_from(sig) else {
+        tracing::debug!(
+            len = sig.len(),
+            "[DNSSEC] ML-DSA-44 signature has wrong length (expected 2420)"
+        );
+        return false;
+    };
+    let Some(sig_obj) = MlDsaSignature::<MlDsa44>::decode(&sig_enc) else {
+        tracing::debug!("[DNSSEC] ML-DSA-44 signature decode failed");
+        return false;
+    };
+
+    vk.verify(message, &sig_obj).is_ok()
+}
 fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     if bytes.is_empty() {
         return None;
@@ -979,7 +1158,7 @@ fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     } else {
         (bytes[0] as usize, &bytes[1..])
     };
-    if rest.len() < exp_len {
+if rest.len() < exp_len {
         return None;
     }
     let (exponent, modulus) = rest.split_at(exp_len);

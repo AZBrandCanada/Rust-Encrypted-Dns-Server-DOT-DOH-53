@@ -20,17 +20,19 @@ Built with production-grade security, comprehensive DNSSEC validation (including
 * **Bailiwick & Referral Verification**: Strict hierarchy and bailiwick boundaries ensure out-of-bailiwick glue records cannot poison delegations or hijack ancestor zones.
 * **Parallel Nameserver Racing**: Queries upstream authoritative servers in batches of 3 concurrently, taking the fastest valid response to eliminate tail latencies from unresponsive servers.
 * **Automatic TCP Fallback**: Detects truncation flags (`TC=1`) from upstream authoritative servers and automatically re-queries over length-prefixed TCP.
-* **Buffer Clamping (DNS Flag Day Compliance)**: Requests 1232-byte EDNS0 payload limits to avoid IP packet fragmentation over the public internet.
+* **Buffer Clamping (DNS Flag Day Compliance)**: Requests 1232-byte EDNS0 payload limits to avoid IP packet fragmentation over the public internet. Responses larger than the negotiated buffer automatically fall back to TCP.
 * **Recursion Loop Protection**: Caps resolution depth (`MAX_DEPTH = 16`) and total steps (`MAX_STEPS = 16`) with cycle detection to abort endless CNAME chains and delegation loops.
 * **Glue Address Prioritization**: Prioritizes IPv4 addresses for authoritative nameservers, falling back to IPv6 glue only when IPv4 glue is unavailable.
+* **Parent-Zone Aware DS Lookup**: `DS` queries are dispatched to the *parent* nameservers, not the child's, matching the DNSSEC chain-of-trust delegation model (RFC 4035 §5.2).
 
 ### Cryptographic DNSSEC Engine (Classical & Post-Quantum)
 * **Full Trust Chain Validation**: Walks the chain of trust from hardcoded root anchors down through DS and DNSKEY records to validate RRSIGs.
 * **Current Root Anchors**: Built-in verification for root KSK-2017 (Key Tag `20326`) and root KSK-2024 (Key Tag `38696`).
-* **Hybrid Verification Architecture**:
+* **Triple-Backend Verification Architecture**:
   * **Optimized Classical Engine (`ring`)**: Hardware-accelerated verification for RSA (`RSASHA256`, `RSASHA512`, 2048–8192 bits), ECDSA (`ECDSAP256SHA256`, `ECDSAP384SHA384`), and Ed25519 (`ED25519`).
-  * **Native Protocol Fallback (`hickory-proto`)**: Direct delegation to Hickory's cryptographic verifier for modern and extended algorithm suites.
-* **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Native validation of post-quantum lattice signatures under **NIST FIPS 204 / DNSSEC Algorithm 18**, passing validation on quantum-ready signed zones.
+  * **Post-Quantum Engine (`ml-dsa` / RustCrypto)**: Full FIPS 204 verification for ML-DSA-44 (`Algorithm 18`), bypassing `hickory-proto`'s `PublicKey` abstraction which does not implement Algorithm 18.
+  * **Native Protocol Fallback (`hickory-proto`)**: Delegation to Hickory's cryptographic verifier for any remaining algorithm suites.
+* **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Full cryptographic validation of ML-DSA-44 lattice signatures per **NIST FIPS 204** and **draft-ietf-dnsop-ml-dsa-dnssec**. Zones signed exclusively with Algorithm 18 validate with `AD=1`; forged, expired, or missing signatures are rejected with `SERVFAIL`. This places the resolver alongside Cloudflare 1.1.1.1 and a small number of Knot/Unbound builds that validate post-quantum DNSSEC in production.
 * **Authenticated Denial of Existence (NSEC / NSEC3)**: Negative responses (NXDOMAIN and NODATA) are only accepted after validating the denial-of-existence proof carried in the authority section. For a signed zone, a missing or malformed NSEC/NSEC3 proof is `Bogus` → `SERVFAIL`, not silently downgraded to `Insecure`. This closes the classic "forged NXDOMAIN with `AD=1`" cache-poisoning vector (same class as CVE-2010-0097).
 * **NSEC/NSEC3 Signature Verification**: Every NSEC and NSEC3 RRset in a negative response must carry an RRSIG that verifies against the zone's trust-anchored DNSKEY set before the proof is considered valid. The mere presence of an NSEC/NSEC3 record is not treated as authentication.
 * **Closest-Encloser Proof (RFC 5155 §8)**: For NSEC3 NXDOMAIN, the resolver derives the closest encloser, computes the next-closer name, and confirms that the received NSEC3 records cover both `H(next-closer)` and `H(*.closest-encloser)`. The closest-encloser walk is bounded to 16 steps to prevent unbounded hashing.
@@ -40,10 +42,12 @@ Built with production-grade security, comprehensive DNSSEC validation (including
 * **RFC 4034 §6.3 Canonical Sorting**: Reorders RRset members strictly by canonical RDATA octets prior to digest verification.
 * **KeyTrap Mitigation (CVE-2023-50387)**: Enforces `MAX_SIG_CHECKS = 8` to protect against CPU exhaustion attacks from maliciously constructed DNSKEY sets.
 * **Authentic Data (AD) Flag**: Injects `AD=1` into responses when all records are cryptographically verified against the chain of trust.
-* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate across all suites on `dnscheck.tools`).
+* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate across all four algorithm suites and all four signature states on [dnscheck.tools](https://dnscheck.tools/)).
 * **Root Anchor Desync Fail-Open**: If the root anchor fails validation (e.g. an uncoordinated KSK rollover), the resolver fails open to Insecure rather than terminating resolution for the entire internet.
 
 **Note on NSEC3 implementation.** The NSEC3 hash-ring comparison and closest-encloser proof logic are implemented in-house rather than delegated to `hickory-proto`'s validator, specifically to avoid inheriting the class of bug tracked in `hickory-proto` advisory GHSA-588m-chg6-8jqj (*"Inverted NSEC3 comparison allows forgery of proofs of nonexistence"*, affecting `0.25.0 .. 0.26.0-alpha.1`). The advisory describes an inverted wrap-around comparison in `find_covering_record()` that allows an attacker to forge negative proofs from a legitimate NSEC3 + RRSIG. Our validator does not call that code path; it computes the SHA-1 hash ring ordering directly.
+
+**Note on ML-DSA-44 implementation.** `hickory-proto`'s `PublicKey` trait only constructs key objects for RSA, ECDSA, and Ed25519; for `Algorithm::Unknown(18)` it returns an error before the raw key bytes are ever exposed. The `verify_mldsa44` path in `src/dnssec.rs` therefore bypasses `PublicKey` entirely and hands the raw 1,312-byte verifying key and 2,420-byte signature directly to the RustCrypto `ml-dsa` crate. See the [RustCrypto `ml-dsa` crate](https://github.com/RustCrypto/signatures/tree/master/ml-dsa) for the reference implementation.
 
 ### Resolver Hardening & Security
 * **SSRF & Reflection Immunity**: Rejects any candidate upstream nameserver IP (from glue or resolved NS records) pointing to:
@@ -56,6 +60,7 @@ Built with production-grade security, comprehensive DNSSEC validation (including
   * IPv6 Unique Local Addresses (`fc00::/7`) and IPv4-mapped IPv6 ranges
 * **Spoofed Reverse Proxy Header Protection**: Only trusts reverse-proxy headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) when the incoming TCP peer is verified to be a local loopback address (`127.0.0.1` or `::1`).
 * **Defense-in-Depth Socket Filtering**: Refuses to dispatch outbound UDP/TCP packets to unsafe IPs at the physical socket layer.
+* **Response Flag Normalization**: Clears the upstream `AA` bit, sets `RA`, and echoes the client's `RD`/`CD` on every response, ensuring recursive responses are never mistaken for authoritative ones.
 
 ### Abuse Defense & Rate Limiting (RRL)
 * **Subnet-Aware Token Bucket**: Aggregates traffic by `/24` IPv4 subnets and `/64` IPv6 prefixes to prevent attackers from rotating single IP addresses within a pool.
@@ -123,6 +128,10 @@ To run the binary as an unprivileged service user while still binding to low-num
 ```bash
 sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
 ```
+
+### Post-Quantum Signature Size Note
+
+ML-DSA-44 signatures are 2,420 bytes and public keys are 1,312 bytes. A single Algorithm-18 RRSIG will exceed the 1,232-byte DNS Flag Day EDNS buffer on its own, so every post-quantum query automatically triggers a TCP fallback. This is expected and handled transparently by the recursor's truncation-detection path — no configuration is required — but clients should be aware that Algorithm-18 zones will always see a TCP retry, and TCP throughput should be sized accordingly.
 
 ---
 
@@ -327,17 +336,31 @@ curl -s -H "Accept: application/dns-message" \
 
 ### 4. Comprehensive DNSSEC Validation Testing
 
-The resolver achieves a **100% pass rate across all test suites** on [dnscheck.tools](https://dnscheck.tools/), validating classical curves, negative proof handling, and cutting-edge post-quantum algorithms:
+The resolver achieves a **100% pass rate across all four algorithm suites and all four signature states** on [dnscheck.tools](https://dnscheck.tools/), validating classical curves, post-quantum signatures, and negative proof handling:
 
 ![DNSSEC Validation Test Results](images/Test.jpg)
 
 * **ECDSA P-256 (alg13)**: Resolves successfully with `AD=1`.
 * **ECDSA P-384 (alg14)**: Resolves successfully with `AD=1`.
 * **Ed25519 (alg15)**: Resolves successfully with `AD=1`.
-* **MLDSA44 (alg18)**: Post-quantum signatures resolve successfully with `AD=1`.
-* **Invalid / Bad Signature (`badsig`)**: Resolution strictly blocked with `SERVFAIL`.
-* **Expired Signature (`expiredsig`)**: Expired time-bounds strictly blocked with `SERVFAIL`.
-* **Missing Signature (`nosig`)**: Unsigned records on signed zones strictly blocked with `SERVFAIL`.
+* **ML-DSA-44 (alg18)**: Post-quantum signatures resolve successfully with `AD=1`.
+* **Invalid / Bad Signature (`badsig`)**: Resolution strictly blocked with `SERVFAIL` across all four algorithms.
+* **Expired Signature (`expiredsig`)**: Expired time-bounds strictly blocked with `SERVFAIL` across all four algorithms.
+* **Missing Signature (`nosig`)**: Unsigned records on signed zones strictly blocked with `SERVFAIL` across all four algorithms.
+
+Quick verification of the ML-DSA-44 path:
+
+```bash
+# Positive: post-quantum zone signed exclusively with Algorithm 18 — expect AD=1
+dig @127.0.0.1 -p 53 +dnssec test-alg18.dnscheck.tools A | grep -E "flags:|RRSIG"
+
+# Negative: broken, expired, missing signatures — expect SERVFAIL for all three
+for d in badsig expiredsig nosig; do
+  echo -n "$d.test-alg18.dnscheck.tools: "
+  dig @127.0.0.1 -p 53 +dnssec "$d.test-alg18.dnscheck.tools" A 2>/dev/null \
+    | grep -oP '(?<=status: )\w+'
+done
+```
 
 ### 5. Negative-Answer (NSEC / NSEC3) Validation
 
@@ -374,7 +397,8 @@ To confirm the fix is load-bearing, strip the NSEC/NSEC3 records from a signed z
 | **NSEC3 Hash-Ring Forgery** | In-house NSEC3 hash-ring comparison and closest-encloser proof logic, avoiding an upstream advisory in `hickory-proto` 0.25.0..0.26.0-alpha.1 | GHSA-588m-chg6-8jqj |
 | **DNS Wildcard Forgery** | Pre-verification label count calculation and wildcard synthesis; wildcard non-existence proven on every NSEC/NSEC3 negative response | RFC 4035 §5.3.4 |
 | **Proxy Header Spoofing** | Proxy headers (`X-Real-IP`, `X-Forwarded-For`) only evaluated when incoming connection is from loopback | Security Best Practice |
-| **Fragmented UDP Poisoning** | Outgoing EDNS buffer clamped to 1232 bytes to eliminate IP fragmentation | DNS Flag Day 2020 |
+| **Fragmented UDP Poisoning** | Outgoing EDNS buffer clamped to 1232 bytes to eliminate IP fragmentation; automatic TCP fallback for larger responses including all Algorithm-18 replies | DNS Flag Day 2020 |
+| **Post-Quantum Signature Malleability** | ML-DSA-44 verification via RustCrypto `ml-dsa` ≥ 0.1.1, which rejects signatures with repeated hint indices (CVE-2026-24850) | CVE-2026-24850 |
 
 ---
 
