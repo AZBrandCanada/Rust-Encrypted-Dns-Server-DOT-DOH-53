@@ -84,7 +84,9 @@ pub async fn process_dns_wire(
     );
     let now = now_secs();
 
+    // ---------------------------------------------------------------------
     // 1. Cache hit path
+    // ---------------------------------------------------------------------
     if let Some(entry) = state.cache.get(&cache_key) {
         let age = now.saturating_sub(entry.cached_at);
         let is_stale = age >= entry.min_ttl as u64;
@@ -98,18 +100,50 @@ pub async fn process_dns_wire(
                 let in_flight_clone = state.in_flight.clone();
 
                 tokio::spawn(async move {
-                    if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
-                        if !fresh_msg.answers().is_empty() {
-                            let all_records: Vec<_> = fresh_msg.answers().to_vec();
-                            let status = DnssecValidator::validate_answer(
-                                &recursor_clone,
-                                &name_clone,
-                                qtype,
-                                &all_records,
-                            )
-                            .await;
-                            fresh_msg.set_authentic_data(status == DnssecStatus::Secure);
+                    if let Ok(mut fresh_msg) =
+                        recursor_clone.resolve(&name_clone, qtype).await
+                    {
+                        // Validate the fresh response.  For a signed zone,
+                        // this either confirms AD=1 (Secure), clears AD
+                        // (Insecure / unsigned zone), or rejects the
+                        // response entirely (Bogus).  Negative responses
+                        // (NXDOMAIN / NODATA) go through the NSEC/NSEC3
+                        // proof path via validate_message.
+                        let status = DnssecValidator::validate_message(
+                            &recursor_clone,
+                            &fresh_msg,
+                            &name_clone,
+                            qtype,
+                        )
+                        .await;
+
+                        match status {
+                            DnssecStatus::Secure => {
+                                fresh_msg.set_authentic_data(true);
+                            }
+                            DnssecStatus::Insecure => {
+                                fresh_msg.set_authentic_data(false);
+                            }
+                            DnssecStatus::Bogus => {
+                                // Do NOT overwrite a previously-good cache
+                                // entry with a Bogus verdict from a fresh
+                                // resolution.  The upstream we hit may be
+                                // under attack, misconfigured, or simply
+                                // flaky; keeping the old entry bounds the
+                                // blast radius of a transient failure and
+                                // prevents a race-winner from poisoning
+                                // a name we already had correct.
+                                tracing::warn!(
+                                    domain = %name_clone,
+                                    rtype = %qtype,
+                                    "[DNSSEC] Bogus response during stale \
+                                     revalidation; keeping previous cache entry"
+                                );
+                                in_flight_clone.remove(&key_clone);
+                                return;
+                            }
                         }
+
                         if is_cacheable(&fresh_msg) {
                             if let Ok(wire) = fresh_msg.to_bytes() {
                                 let ttl = calculate_min_ttl(&fresh_msg);
@@ -124,7 +158,9 @@ pub async fn process_dns_wire(
                                     },
                                 );
                             }
-                        } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
+                        } else if let Some(mut existing) =
+                            cache_clone.get_mut(&key_clone)
+                        {
                             existing.last_revalidated_at = now_secs();
                         }
                     }
@@ -150,44 +186,53 @@ pub async fn process_dns_wire(
         return wire;
     }
 
+    // ---------------------------------------------------------------------
     // 2. Cache miss path
+    // ---------------------------------------------------------------------
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
-            if !resp_msg.answers().is_empty() {
-                let all_records: Vec<_> = resp_msg.answers().to_vec();
-                let dnssec_status = DnssecValidator::validate_answer(
-                    &state.recursor,
-                    &qname,
-                    qtype,
-                    &all_records,
-                )
-                .await;
+            // Validate the full message.  This dispatches on whether the
+            // answer section is empty:
+            //
+            //   * Positive answers  -> RRSIG on the RRset, chain to root.
+            //   * NXDOMAIN / NODATA -> NSEC or NSEC3 denial-of-existence
+            //                          proof validated against the zone
+            //                          keys.
+            //
+            // Prior to this change, negative responses skipped validation
+            // entirely: a forged NXDOMAIN from an on-path attacker (or a
+            // compromised authoritative server) was accepted and cached.
+            let dnssec_status = DnssecValidator::validate_message(
+                &state.recursor,
+                &resp_msg,
+                &qname,
+                qtype,
+            )
+            .await;
 
-                match dnssec_status {
-                    DnssecStatus::Secure => {
-                        resp_msg.set_authentic_data(true);
+            match dnssec_status {
+                DnssecStatus::Secure => {
+                    resp_msg.set_authentic_data(true);
+                }
+                DnssecStatus::Insecure => {
+                    resp_msg.set_authentic_data(false);
+                }
+                DnssecStatus::Bogus => {
+                    if state.dnssec_enforce {
+                        tracing::warn!(
+                            protocol,
+                            client = %client_ip,
+                            domain = %qname,
+                            rtype = %qtype,
+                            "[DNSSEC] Bogus DNSSEC proof (positive or \
+                             negative); returning SERVFAIL"
+                        );
+                        return make_servfail_wire(req_msg.id(), Some(query));
                     }
-                    DnssecStatus::Insecure => {
-                        resp_msg.set_authentic_data(false);
-                    }
-                    DnssecStatus::Bogus => {
-                        let qname_lower = qname.to_string().to_lowercase();
-                        let is_test_probe = qname_lower.contains("badsig")
-                            || qname_lower.contains("expiredsig")
-                            || qname_lower.contains("nosig");
-
-                        if state.dnssec_enforce || is_test_probe {
-                            tracing::warn!(
-                                protocol,
-                                client = %client_ip,
-                                domain = %qname,
-                                rtype = %qtype,
-                                "[DNSSEC] Bogus signature detected; returning SERVFAIL"
-                            );
-                            return make_servfail_wire(req_msg.id(), Some(query));
-                        }
-                        resp_msg.set_authentic_data(false);
-                    }
+                    // Enforcement disabled: surface the answer but
+                    // explicitly downgrade the AD bit so downstream
+                    // validators know we did not confirm it.
+                    resp_msg.set_authentic_data(false);
                 }
             }
 
