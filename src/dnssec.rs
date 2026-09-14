@@ -969,7 +969,7 @@ fn collect_cname_chain(name: &Name, records: &[Record]) -> Vec<(Name, Name)> {
 /// The result is cached per zone for 5 minutes, but `Unknown` results are
 /// never cached so a transient failure doesn't stick.
 async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSignedness {
-    // Cheap fast-path via the signed-zone cache.
+    // 1. Cheap fast-path via the signed-zone cache.
     let cache = signed_zone_cache();
     let mut cur = name.clone();
     loop {
@@ -982,12 +982,10 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
 
                     // Signed CANNOT be inherited from root ('.') or TLDs ('.com')!
                     ZoneSignedness::Signed => {
-                        // In hickory-proto: root has 1 label (""), a TLD like "com." has 2 labels ("com", "")
                         if cur.is_root() || cur.num_labels() <= 2 {
                             if cur == *name {
                                 return ZoneSignedness::Signed;
                             }
-                            // Do NOT inherit Signed from '.' or a TLD downwards!
                         } else {
                             return ZoneSignedness::Signed;
                         }
@@ -1003,11 +1001,60 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         cur = cur.base_name();
     }
 
-    // Fast path: SOA query returns the SOA's own RRSIG when the zone is
-    // signed, so we can answer "yes" without a DS lookup.
-    let soa_msg = match recursor.resolve(name, RecordType::SOA).await {
-        Ok(m) => m,
-        Err(_) => return ZoneSignedness::Unknown,
+    // 2. Walk up from `name` to find the real zone apex SOA.
+    // For CNAMEs and subdomains (like sync.opera.com), querying SOA on the leaf
+    // returns a CNAME or empty answers. Trimming to the base domain (e.g. opera.com)
+    // correctly discovers the true zone apex.
+    let mut apex_candidate = name.clone();
+    let mut soa_msg = None;
+    let mut zone = None;
+
+    while apex_candidate.num_labels() > 2 {
+        if let Ok(m) = recursor.resolve(&apex_candidate, RecordType::SOA).await {
+            let found = m
+                .answers()
+                .iter()
+                .chain(m.name_servers().iter())
+                .find_map(|r| {
+                    if matches!(r.data(), RData::SOA(_)) {
+                        Some(r.name().clone())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(z) = found {
+                soa_msg = Some(m);
+                zone = Some(z);
+                break;
+            }
+        }
+        apex_candidate = apex_candidate.base_name();
+    }
+
+    // Fallback if no apex was found during the walk
+    let (soa_msg, zone) = match (soa_msg, zone) {
+        (Some(m), Some(z)) => (m, z),
+        _ => {
+            let m = match recursor.resolve(&apex_candidate, RecordType::SOA).await {
+                Ok(m) => m,
+                Err(_) => return ZoneSignedness::Unknown,
+            };
+            let z = m
+                .answers()
+                .iter()
+                .chain(m.name_servers().iter())
+                .find_map(|r| {
+                    if matches!(r.data(), RData::SOA(_)) {
+                        Some(r.name().clone())
+                    } else {
+                        None
+                    }
+                });
+            match z {
+                Some(zone_name) => (m, zone_name),
+                None => return ZoneSignedness::Unknown,
+            }
+        }
     };
 
     let soa_has_rrsig = soa_msg
@@ -1021,24 +1068,6 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
                     if sig.type_covered() == RecordType::SOA
             )
         });
-
-    // Find the zone apex from the SOA (may be in answers OR authority).
-    let zone = soa_msg
-        .answers()
-        .iter()
-        .chain(soa_msg.name_servers().iter())
-        .find_map(|r| {
-            if matches!(r.data(), RData::SOA(_)) {
-                Some(r.name().clone())
-            } else {
-                None
-            }
-        });
-
-    let zone = match zone {
-        Some(z) => z,
-        None => return ZoneSignedness::Unknown,
-    };
 
     if soa_has_rrsig {
         cache.insert(
@@ -1067,18 +1096,12 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         return ZoneSignedness::Signed;
     }
 
-    // Slow path: DS lookup at the apex.
+    // 3. Slow path: DS lookup at the apex
     let ds_msg = match recursor.resolve(&zone, RecordType::DS).await {
         Ok(m) => m,
         Err(_) => return ZoneSignedness::Unknown,
     };
 
-    // Presence of a DS RRset is authoritative: it means the parent has
-    // committed to signing this zone. Absence means the zone is unsigned
-    // (per RFC 4035 §5.2) — but only if the response actually came from the
-    // parent's authoritative servers. We cannot prove that here, so we treat
-    // a clean NODATA as ProvenUnsigned and cache it; anything else is
-    // Unknown.
     let ds_present = ds_msg.answers().iter().any(|r| {
         r.record_type() == RecordType::DS && r.name() == &zone
     });
