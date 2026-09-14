@@ -29,13 +29,13 @@ Built with production-grade security, comprehensive DNSSEC validation (including
 * **Current Root Anchors**: Built-in verification for root KSK-2017 (Key Tag `20326`) and root KSK-2024 (Key Tag `38696`).
 * **Hybrid Verification Architecture**:
   * **Optimized Classical Engine (`ring`)**: Hardware-accelerated verification for RSA (`RSASHA256`, `RSASHA512`, 2048–8192 bits), ECDSA (`ECDSAP256SHA256`, `ECDSAP384SHA384`), and Ed25519 (`ED25519`).
-  * **Native Protocol Fallback (`hickory-proto`)**: Direct delegation to Hickory's cryptographic verifier for extended and modern suites.
-* **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Native validation of post-quantum lattice signatures under **NIST FIPS 204 / DNSSEC Algorithm 18**, allowing full validation of PQ-signed zones (e.g. `test-alg18.dnscheck.tools`).
+  * **Native Protocol Fallback (`hickory-proto`)**: Direct delegation to Hickory's cryptographic verifier for modern and extended algorithm suites.
+* **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Native validation of post-quantum lattice signatures under **NIST FIPS 204 / DNSSEC Algorithm 18**, passing validation on quantum-ready signed zones.
 * **RFC 4035 §5.3.4 Wildcard Synthesis**: Accurately detects and synthesizes wildcard labels before signature verification.
 * **RFC 4034 §6.3 Canonical Sorting**: Reorders RRset members strictly by canonical RDATA octets prior to digest verification.
 * **KeyTrap Mitigation (CVE-2023-50387)**: Enforces `MAX_SIG_CHECKS = 8` to protect against CPU exhaustion attacks from maliciously constructed DNSKEY sets.
 * **Authentic Data (AD) Flag**: Injects `AD=1` into responses when all records are cryptographically verified against the chain of trust.
-* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate on `dnscheck.tools` across alg13, alg14, alg15, and alg18).
+* **Active Tamper Blocking**: Rejects bogus, expired, forged, or unauthenticated records on signed zones with `SERVFAIL` (100% pass rate across all suites on `dnscheck.tools`).
 * **Root Anchor Desync Fail-Open**: If the root anchor fails validation (e.g. an uncoordinated KSK rollover), the resolver fails open to Insecure rather than terminating resolution for the entire internet.
 
 ### Resolver Hardening & Security
@@ -318,18 +318,17 @@ curl -s -H "Accept: application/dns-message" \
 
 ### 4. Comprehensive DNSSEC Validation Testing
 
-To verify full cryptographic chain verification:
+The resolver achieves a **100% pass rate across all test suites** on [dnscheck.tools](https://dnscheck.tools/), validating classical curves, negative proof handling, and cutting-edge post-quantum algorithms:
 
-1. Configure your client or browser to point to your DoH or DoT endpoint.
-2. Visit [dnscheck.tools](https://dnscheck.tools/).
-3. Confirm that all DNSSEC test records pass:
-   * **ECDSA P-256 (alg13)**: Resolves successfully with `AD=1`.
-   * **ECDSA P-384 (alg14)**: Resolves successfully with `AD=1`.
-   * **Ed25519 (alg15)**: Resolves successfully with `AD=1`.
-   * **ML-DSA-44 (alg18)**: Post-quantum signatures resolve successfully with `AD=1`.
-   * **Invalid / Bad Signature (`badsig`)**: Resolution fails with `SERVFAIL`.
-   * **Expired Signature (`expiredsig`)**: Resolution fails with `SERVFAIL`.
-   * **Missing Signature (`nosig`)**: Resolution fails with `SERVFAIL`.
+![DNSSEC Validation Test Results](images/Test.jpg)
+
+* **ECDSA P-256 (alg13)**: Resolves successfully with `AD=1`.
+* **ECDSA P-384 (alg14)**: Resolves successfully with `AD=1`.
+* **Ed25519 (alg15)**: Resolves successfully with `AD=1`.
+* **MLDSA44 (alg18)**: Post-quantum signatures resolve successfully with `AD=1`.
+* **Invalid / Bad Signature (`badsig`)**: Resolution strictly blocked with `SERVFAIL`.
+* **Expired Signature (`expiredsig`)**: Expired time-bounds strictly blocked with `SERVFAIL`.
+* **Missing Signature (`nosig`)**: Unsigned records on signed zones strictly blocked with `SERVFAIL`.
 
 ---
 
