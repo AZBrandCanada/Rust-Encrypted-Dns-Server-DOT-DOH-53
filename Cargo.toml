@@ -3,6 +3,14 @@
 name = "unified-dns"
 version = "1.0.0"
 edition = "2021"
+description = "A high-performance iterative recursive DNS resolver supporting DNS, DNS over TLS, and DNS over HTTPS."
+license = "MIT"
+repository = "https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver"
+homepage = "https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver"
+readme = "README.md"
+keywords = ["dns", "dnssec", "resolver", "dot", "doh"]
+categories = ["network-programming"]
+
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "query", "matched-path"] }
