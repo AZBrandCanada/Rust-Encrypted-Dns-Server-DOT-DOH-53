@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: write
@@ -87,7 +87,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/${{ matrix.artifact }}.tar.gz
-            dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/${{ matrix.artifact }}.sha256
 
   release:
     name: Create GitHub Release
