@@ -94,8 +94,8 @@ fn signed_zone_cache() -> &'static DashMap<String, SignedZoneEntry> {
 }
 
 enum ChainResult {
-    Trusted(Vec<DNSKEY>),
-    Unsigned,
+    Trusted { keys: Vec<DNSKEY>, ttl: u32 },
+    Unsigned { ttl: u32 },
     Bogus,
 }
 
@@ -107,6 +107,7 @@ enum RedirectionStep {
     },
     Dname {
         dname_owner: Name,
+        #[allow(dead_code)]
         target: Name,
         input_name: Name,
         redirected_name: Name,
@@ -378,7 +379,7 @@ impl DnssecValidator {
             let zone = rrsig.signer_name();
 
             match Self::build_trust_chain(recursor, zone, budget).await {
-                ChainResult::Trusted(trusted_keys) => {
+                ChainResult::Trusted { keys: trusted_keys, .. } => {
                     any_trusted_chain = true;
                     for dnskey in &trusted_keys {
                         if !budget.can_check_sig() {
@@ -399,7 +400,7 @@ impl DnssecValidator {
                         }
                     }
                 }
-                ChainResult::Unsigned => {
+                ChainResult::Unsigned { .. } => {
                     tracing::debug!(
                         signer = %zone,
                         owner = %owner,
@@ -462,8 +463,8 @@ impl DnssecValidator {
         }
 
         let keys = match Self::build_trust_chain(recursor, &zone, budget).await {
-            ChainResult::Trusted(k) => k,
-            ChainResult::Unsigned => {
+            ChainResult::Trusted { keys: k, .. } => k,
+            ChainResult::Unsigned { .. } => {
                 tracing::debug!(
                     zone = %zone,
                     qname = %qname,
@@ -505,6 +506,7 @@ impl DnssecValidator {
         DnssecStatus::Bogus
     }
 
+    /// Full RRset modeling: groups all records matching owner and type before signature verification
     fn verify_negative_rrset(
         rec: &Record,
         authority: &[Record],
@@ -535,14 +537,23 @@ impl DnssecValidator {
             return false;
         }
 
-        let records = [rec.clone()];
+        let full_rrset: Vec<Record> = authority
+            .iter()
+            .filter(|r| r.name() == &owner && r.record_type() == rtype)
+            .cloned()
+            .collect();
+
+        if full_rrset.is_empty() {
+            return false;
+        }
+
         for sig in &rrsigs {
             for key in keys {
                 if key.key_tag_matches(sig.key_tag()) {
                     if !budget.can_check_sig() {
                         return false;
                     }
-                    if Self::verify_rrsig(sig, key, &owner, &records) {
+                    if Self::verify_rrsig(sig, key, &owner, &full_rrset) {
                         return true;
                     }
                 }
@@ -700,6 +711,7 @@ impl DnssecValidator {
 
         let cache = key_trust_cache();
         let mut trusted_parent_keys: Option<Vec<DNSKEY>> = None;
+        let mut last_ttl = 300u32;
 
         for zone in &path {
             let zone_key = zone.to_string().to_lowercase();
@@ -764,11 +776,12 @@ impl DnssecValidator {
 
                     match denial_status {
                         DnssecStatus::Secure | DnssecStatus::InsecureUnsigned => {
+                            let ds_proof_ttl = calculate_min_ttl(&ds_msg);
                             tracing::debug!(
                                 zone = %zone,
                                 "[DNSSEC] Authenticated denial of DS verified: zone is Insecure"
                             );
-                            return ChainResult::Unsigned;
+                            return ChainResult::Unsigned { ttl: ds_proof_ttl };
                         }
                         _ => {
                             tracing::warn!(
@@ -842,11 +855,12 @@ impl DnssecValidator {
                     .collect();
 
                 if anchors.is_empty() {
+                    let ds_ttl = calculate_min_ttl(&ds_msg);
                     tracing::warn!(
                         zone = %zone,
                         "[DNSSEC] DS RRset has no supported SHA-256 or SHA-384 digests; Unsigned"
                     );
-                    return ChainResult::Unsigned;
+                    return ChainResult::Unsigned { ttl: ds_ttl };
                 }
 
                 anchors
@@ -952,20 +966,29 @@ impl DnssecValidator {
             }
 
             let ttl = calculate_min_ttl(&dnskey_msg);
+            last_ttl = ttl;
+
+            // RFC 4035 §5.2: Authenticate all keys in the verified DNSKEY RRset
+            // that possess the Zone Key flag (bit 7 = 1).
+            let authenticated_zone_keys: Vec<DNSKEY> = candidates
+                .into_iter()
+                .filter(|k| (k.flags() & 0x0100) != 0)
+                .collect();
+
             cache.insert(
                 zone_key,
                 CachedZoneKeys {
-                    keys: candidates.clone(),
+                    keys: authenticated_zone_keys.clone(),
                     expires_at: now_secs() + ttl as u64,
                 },
             );
 
-            trusted_parent_keys = Some(candidates);
+            trusted_parent_keys = Some(authenticated_zone_keys);
         }
 
         match trusted_parent_keys {
-            Some(keys) => ChainResult::Trusted(keys),
-            None => ChainResult::Unsigned,
+            Some(keys) => ChainResult::Trusted { keys, ttl: last_ttl },
+            None => ChainResult::Unsigned { ttl: last_ttl },
         }
     }
 
@@ -1414,10 +1437,10 @@ async fn is_zone_signed(
         }
     };
 
-    let signedness = match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
-        ChainResult::Trusted(_) => ZoneSignedness::Signed,
-        ChainResult::Unsigned => ZoneSignedness::ProvenUnsigned,
-        ChainResult::Bogus => ZoneSignedness::Unknown,
+    let (signedness, proof_ttl) = match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
+        ChainResult::Trusted { ttl, .. } => (ZoneSignedness::Signed, ttl),
+        ChainResult::Unsigned { ttl } => (ZoneSignedness::ProvenUnsigned, ttl),
+        ChainResult::Bogus => (ZoneSignedness::Unknown, 0),
     };
 
     if signedness != ZoneSignedness::Unknown {
@@ -1425,7 +1448,7 @@ async fn is_zone_signed(
             zone.to_string().to_lowercase(),
             SignedZoneEntry {
                 signedness,
-                expires_at: now_secs() + 300,
+                expires_at: now_secs() + proof_ttl.min(86400) as u64,
             },
         );
     }
@@ -1625,25 +1648,17 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
         out.extend_from_slice(&name_buf);
     }
 
-    // RFC 4034 §3.1.3: rrsig.num_labels() excludes the root label.
-    // Hickory's owner.num_labels() includes the root label.
     let sig_labels = rrsig.num_labels() as usize;
-    let actual_owner_labels = if owner.is_root() {
-        0
-    } else {
-        (owner.num_labels().saturating_sub(1)) as usize
-    };
+    let owner_labels = owner.num_labels() as usize;
 
-    let canonical_owner_raw = if actual_owner_labels > sig_labels {
-        // Legitimate wildcard expansion (RFC 4035 §5.3.4):
-        // Retain rightmost sig_labels and prepend "*."
-        let base = owner.trim_to(sig_labels + 1); // +1 because trim_to in Hickory includes root
+    let canonical_owner_raw = if owner_labels > sig_labels {
+        let base = owner.trim_to(sig_labels);
         Name::from_str(&format!("*.{}", base)).unwrap_or_else(|_| owner.clone())
     } else {
         owner.clone()
     };
 
-    // RFC 4034 §6.2: Owner name MUST be canonical lowercase
+    // RFC 4034 §6.2: Owner name MUST be canonical lowercase in wire format
     let canonical_owner = canonical_owner_raw.to_lowercase();
 
     struct CanonicalEntry {
@@ -1687,6 +1702,7 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
 
     Some(out)
 }
+
 fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
     match algorithm {
         Algorithm::RSASHA256 | Algorithm::RSASHA512 => {

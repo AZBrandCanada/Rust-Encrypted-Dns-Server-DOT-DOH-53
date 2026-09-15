@@ -114,15 +114,12 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
                 return false;
             }
             let o = v4.octets();
-            // 100.64.0.0/10 - Carrier-Grade NAT (RFC 6598)
             if o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000 {
                 return false;
             }
-            // 198.18.0.0/15 - Benchmarking (RFC 2544)
             if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
                 return false;
             }
-            // 0.0.0.0/8 - "This network"
             if o[0] == 0 {
                 return false;
             }
@@ -133,15 +130,12 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
                 return false;
             }
             let seg0 = v6.segments()[0];
-            // fc00::/7 - Unique Local Addresses
             if (seg0 & 0xfe00) == 0xfc00 {
                 return false;
             }
-            // fe80::/10 - Link-local
             if (seg0 & 0xffc0) == 0xfe80 {
                 return false;
             }
-            // ::ffff:0:0/96 - IPv4-mapped; unwrap and re-check as v4
             let seg = v6.segments();
             if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xffff {
                 let mapped = Ipv4Addr::new(
@@ -328,7 +322,6 @@ impl RecursiveResolver {
                     return Err(RecursorError::NoProgress);
                 }
 
-                // Verify bailiwick boundaries
                 let is_child_of_target = delegation_owner.zone_of(name) || &delegation_owner == name;
                 let is_within_bailiwick = bailiwick.is_root() || bailiwick.zone_of(&delegation_owner) || bailiwick == delegation_owner;
                 if !is_child_of_target || !is_within_bailiwick {
@@ -365,7 +358,6 @@ impl RecursiveResolver {
                     );
                 }
 
-                // Iteratively resolve A and AAAA for nameservers when glue is omitted
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
@@ -473,10 +465,13 @@ impl RecursiveResolver {
 
         while let Some(joined) = set.join_next().await {
             if let Ok(Ok(msg)) = joined {
-                if msg.response_code() != ResponseCode::Refused
-                    && msg.response_code() != ResponseCode::ServFail
-                {
-                    return Some(msg);
+                // Classify upstream responses: only accept NoError or NXDomain.
+                // Refused, ServFail, FormErr, and NotImp fail over to alternate servers.
+                match msg.response_code() {
+                    ResponseCode::NoError | ResponseCode::NXDomain => {
+                        return Some(msg);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -491,10 +486,11 @@ impl RecursiveResolver {
 
             while let Some(joined) = fallback_set.join_next().await {
                 if let Ok(Ok(msg)) = joined {
-                    if msg.response_code() != ResponseCode::Refused
-                        && msg.response_code() != ResponseCode::ServFail
-                    {
-                        return Some(msg);
+                    match msg.response_code() {
+                        ResponseCode::NoError | ResponseCode::NXDomain => {
+                            return Some(msg);
+                        }
+                        _ => {}
                     }
                 }
             }

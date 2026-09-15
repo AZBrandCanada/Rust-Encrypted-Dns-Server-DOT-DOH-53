@@ -1,4 +1,3 @@
-
 # Unified Recursive DNS Server
 
 **IN DEVELOPMENT**
@@ -20,6 +19,7 @@ Built with production-grade security, comprehensive DNSSEC validation (including
 ### Iterative Root Recursion
 * **Autonomous Resolution**: Queries authoritative nameservers iteratively starting from the 13 IANA root nameserver clusters (`a.root-servers.net` through `m.root-servers.net`).
 * **Strict Answer & Redirection QNAME Matching**: Positively matched answers, CNAME aliases, and DNAME redirections must belong to the exact queried name (`r.name() == name`). Out-of-bailiwick or mismatched records in the answer section are rejected, blocking cross-domain response injection and cache poisoning.
+* **Upstream Response Classification & Failover (RFC 8906 / BCP 145)**: The resolver treats `FORMERR` and `NOTIMP` as authoritative server failures alongside `SERVFAIL` and `REFUSED`, automatically failing over to remaining nameservers in the batch rather than accepting protocol errors as terminal answers. Only clean `NOERROR` and `NXDOMAIN` responses terminate server racing.
 * **Full DNAME Redirection Support (RFC 6672)**: Detects delegation name (`DNAME`, Type 39) records, performs canonical suffix replacement (`dname_substitute`), iteratively resolves the redirected target domain, and merges answers seamlessly.
 * **Dual-Stack Nameserver Resolution**: If upstream delegation glue is omitted, the recursor iteratively resolves both `A` and `AAAA` records for authoritative nameservers to maintain full connectivity with IPv6-only authoritative hosts.
 * **Referral Coherence & Bailiwick Verification**: Validates delegation hierarchy and bailiwick boundaries. Enforces NS owner coherence across referral authority sections; mixed or conflicting delegation owners abort the step as `NoProgress`.
@@ -37,6 +37,9 @@ Built with production-grade security, comprehensive DNSSEC validation (including
   * **Post-Quantum Engine (`ml-dsa` / RustCrypto)**: Full FIPS 204 verification for ML-DSA-44 (`Algorithm 18`), bypassing `hickory-proto`'s `PublicKey` abstraction which does not implement Algorithm 18.
   * **Native Protocol Fallback (`hickory-proto`)**: Delegation to Hickory's cryptographic verifier for any remaining algorithm suites.
 * **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Full cryptographic validation of ML-DSA-44 lattice signatures per **NIST FIPS 204** and **draft-ietf-dnsop-ml-dsa-dnssec**. Zones signed exclusively with Algorithm 18 validate with `AD=1`; forged, expired, or missing signatures are rejected with `SERVFAIL`.
+* **RFC 4035 §5.2 KSK/ZSK Trust Hierarchy & Zone Key Filtering**: Validates the child DNSKEY RRset using parent DS-matched keys (KSKs), and authenticates all keys in the validated RRset possessing the `Zone Key` flag (bit 7 = 1) for subsequent zone record verification. Keys lacking the Zone Key flag are rejected from the trusted key set.
+* **RFC 4034 §6.2 Canonical Wire Serialization & Case Normalization**: Guarantees that all domain names (both RR member owner names and RRSIG signer names) are converted to lowercase in the wire-format buffer prior to TBS digest calculation. Prevents digest verification failures on uppercase Base32hex NSEC3 owner names (common in `.com` and `.net` registries).
+* **Full RRset Modeling in Negative Verification**: Negative proofs group all participating NSEC/NSEC3 records by owner and type into full RRsets before verifying RRSIGs, rather than validating isolated single-record fragments.
 * **Authenticated Denial of DS Nonexistence (Anti-Downgrade)**: If a parent zone returns DS NODATA or NXDOMAIN, the resolver **does not** assume the child is unsigned. It cryptographically authenticates the parent's NSEC or NSEC3 denial-of-existence proof using the parent's DNSKEYs. Only an authenticated denial permits a transition to `InsecureUnsigned`; missing, forged, or unauthenticated DS denial proofs are declared `Bogus` → `SERVFAIL`. This defeats on-path DS-stripping downgrade attacks.
 * **Global Cryptographic Work Budget (KeyTrap / CVE-2023-50387)**: Operates a thread-safe, unified `ValidationBudget` (`GLOBAL_MAX_SIG_CHECKS = 24`) shared globally across positive validations, negative proofs, DS verifications, and DNSKEY self-signatures, preventing CPU-exhaustion DoS from complex key/signature combinatorial attacks.
 * **Centralized Signature Time Validation**: Enforces inception and expiration boundaries (`now >= inc && now <= exp`) centrally within `verify_rrsig()`. All validation callers (answer RRsets, NSEC/NSEC3 records, parent DS records, DNSKEY sets) uniformly enforce time boundaries, eliminating negative-proof replay and stale key vulnerabilities.
@@ -84,6 +87,7 @@ Built with production-grade security, comprehensive DNSSEC validation (including
 ### Caching Engine
 * **Stale-While-Revalidate**: Serves expired cached records immediately with zero client latency while asynchronously re-resolving and validating the domain in the background. A `Bogus` verdict during revalidation does **not** overwrite a previously-good cache entry, bounding the blast radius of transient upstream failures or poisoning attempts.
 * **Exact TTL Preservation**: Upstream authoritative TTLs are preserved exactly up to a ceiling of 86,400 seconds without artificial floor clamping. Removed arbitrary 30s answer floors and 300s delegation floors, preventing extended exposure to stale records or delayed DNSKEY rollover windows.
+* **Dynamic Zone-Signedness TTL**: Cached zone-signedness entries dynamically inherit the authoritative TTL from the validated DNSKEY set or negative DS denial proof, eliminating fixed 5-minute staleness windows when zones transition between signed and unsigned states.
 * **Single-Flight Request Deduplication**: Uses an in-flight synchronization registry (`in_flight`) to ensure duplicate background revalidations are never triggered simultaneously for the same RRset.
 * **EDNS `DO` Bit Partitioning**: Separate cache keys for `do=0` and `do=1` ensure clients requesting plain records do not receive bloated DNSSEC signatures, while validating clients retain RRSIGs.
 * **Dynamic Transaction ID Rewriting**: Rewrites bytes 0 and 1 of cached wire responses on the fly to match the requesting client's query ID.
@@ -400,14 +404,16 @@ To confirm the fix is load-bearing, strip the NSEC/NSEC3 records from a signed z
 | **SSRF / Reflection via Glue** | Strict rejection of private, loopback, multicast, link-local, and cloud metadata IPs from glue and resolved NS addresses | RFC 1918, RFC 3927, RFC 6598 |
 | **DNS Cache Poisoning & Record Injection** | Strict queried QNAME verification on answers, CNAME, and DNAME records; random TXID; randomized server selection | RFC 5452 |
 | **Forged NXDOMAIN / Negative Poisoning** | Decomposed NSEC/NSEC3 state machines for NODATA, Wildcard NODATA, and NXDOMAIN; Opt-Out flag handling; 150-iteration cap | RFC 4035 §5.4, RFC 5155 §8, RFC 9276, CVE-2010-0097 |
-| **Authoritative TCP Slowloris / Starvation** | Unified `timeout(TCP_TIMEOUT, ...)` wrapping connection, write, length read, and payload read | Security Best Practice |
+| **Authoritative Upstream Misbehavior / Hangs** | Strict response classification (`FORMERR`/`NOTIMP` trigger server failover); unified whole-transaction TCP timeout (2500ms) | RFC 8906, BCP 145 |
 | **KeyTrap Algorithmic Complexity** | Global `ValidationBudget` shared across all lookup stages (capped to 24 signature checks total) | CVE-2023-50387 |
 | **DNAME Loop / Suffix Manipulation** | Bounded redirection chain tracking with cycle detection; cryptographic validation of both DNAME and synthesized CNAME RRsets | RFC 6672 |
+| **DNSKEY Trust-Boundary Violation** | Strict enforcement of the `Zone Key` flag (bit 7 = 1) on authenticated keys; KSK authenticates full DNSKEY set per RFC 4035 §5.2 | RFC 4034 §2.1.1, RFC 4035 §5.2 |
+| **Canonical TBS Wire Digest Mismatch** | Strict lowercase canonicalization of owner names and signer names in wire TBS construction (resolves Base32hex NSEC3 failures) | RFC 4034 §6.2 |
 | **DNS Amplification** | Instant drop of UDP `ANY` queries; truncated challenges (`TC=1`) when response size exceeds EDNS payload | RFC 8482 |
 | **Volumetric / DoS Floods** | Subnet-aggregated token bucket rate limiting (/24 IPv4, /64 IPv6) with progressive backoff | RFC 5358 |
 | **NSEC3 Hash-Ring Forgery** | In-house NSEC3 hash-ring comparison and closest-encloser proof logic, avoiding an upstream advisory in `hickory-proto` 0.25.0..0.26.0-alpha.1 | GHSA-588m-chg6-8jqj |
 | **DNS Wildcard Forgery** | Pre-verification label count calculation and wildcard synthesis; wildcard non-existence proven on every NSEC/NSEC3 negative response | RFC 4035 §5.3.4 |
-| **Stale Key Window Over-Extension** | Elimination of minimum TTL clamping floors on records, keys, and delegations; honors exact upstream authoritative TTLs | RFC 4034, RFC 5011 |
+| **Stale Key Window Over-Extension** | Elimination of minimum TTL clamping floors; zone-signedness cache inherits exact dynamic proof TTLs | RFC 4034, RFC 5011 |
 | **Proxy Header Spoofing** | Proxy headers (`X-Real-IP`, `X-Forwarded-For`) only evaluated when incoming connection is from loopback | Security Best Practice |
 | **Fragmented UDP Poisoning** | Outgoing EDNS buffer clamped to 1232 bytes to eliminate IP fragmentation; automatic TCP fallback for larger responses including all Algorithm-18 replies | DNS Flag Day 2020 |
 | **Post-Quantum Signature Malleability** | ML-DSA-44 verification via RustCrypto `ml-dsa` ≥ 0.1.1, which rejects signatures with repeated hint indices (CVE-2026-24850) | CVE-2026-24850 |
