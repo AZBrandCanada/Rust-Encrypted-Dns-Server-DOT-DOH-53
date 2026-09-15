@@ -39,7 +39,7 @@ echo
 echo "[3/12] Checking Git working tree..."
 
 if [[ -n "$(git status --porcelain)" ]]; then
-    echo "Changes detected after formatting:"
+    echo "Changes detected:"
     git status --short
     echo
     echo "These changes will be included in the release commit."
@@ -49,20 +49,17 @@ fi
 
 echo
 
-echo "[4/12] Checking Cargo.lock..."
+echo "[4/12] Updating Cargo.lock..."
 
-if ! cargo metadata --locked --no-deps >/dev/null 2>&1; then
-    echo "ERROR: Cargo.lock is missing or out of date."
-    exit 1
-fi
+cargo check --release
 
-echo "OK"
+echo "Cargo.lock is synchronized."
 echo
 
 echo "[5/12] Checking release version..."
 
 PACKAGE_VERSION="$(
-    cargo metadata --format-version 1 --no-deps |
+    cargo metadata --format-version 1 --no-deps --locked |
     sed -n 's/.*"name":"unified-dns","version":"\([^"]*\)".*/\1/p'
 )"
 
@@ -89,7 +86,7 @@ cargo fmt --all -- --check
 echo "OK"
 echo
 
-echo "[7/12] Running cargo check..."
+echo "[7/12] Running locked cargo check..."
 
 cargo check --release --locked
 
@@ -159,8 +156,8 @@ if [[ ! -s README.md ]]; then
     exit 1
 fi
 
-if [[ ! -f Cargo.lock ]]; then
-    echo "ERROR: Cargo.lock is missing."
+if [[ ! -s Cargo.lock ]]; then
+    echo "ERROR: Cargo.lock is missing or empty."
     exit 1
 fi
 
@@ -188,7 +185,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 echo
-echo "[RELEASE] Committing..."
+echo "[RELEASE] Staging changes..."
 
 git add -A
 
@@ -196,6 +193,9 @@ if git diff --cached --quiet; then
     echo "ERROR: Nothing to commit."
     exit 1
 fi
+
+echo
+echo "[RELEASE] Committing..."
 
 git commit -m "Release ${TAG}"
 
