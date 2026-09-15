@@ -20,23 +20,16 @@ pub struct AppState {
     pub in_flight: Arc<DashMap<String, ()>>,
 }
 
-/// Differentiated processing outcome for upstream protocols (DoH, DoT, UDP, TCP).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutcome {
-    /// Successfully produced a standard DNS response wire buffer.
     Success(Vec<u8>),
-    /// Valid query produced a DNS-level SERVFAIL response wire buffer.
     ServFail(Vec<u8>),
-    /// Truncated response challenge (TC=1) for TCP retry or payload amplification mitigation.
     Truncated(Vec<u8>),
-    /// Query dropped intentionally (e.g. rate-limiting or ANY drop).
     Dropped,
-    /// Malformed or unparseable input wire buffer (DoH translates to HTTP 400 Bad Request).
     Malformed,
 }
 
 impl ProcessOutcome {
-    /// Converts the outcome into wire format for transport layers that only handle raw bytes.
     pub fn into_wire(self) -> Vec<u8> {
         match self {
             ProcessOutcome::Success(wire)
@@ -78,7 +71,7 @@ pub fn remaining_rrsig_validity(msg: &Message, now: u64) -> Option<u32> {
             if diff > 0 {
                 min_remaining = min_remaining.min(diff as u32);
             } else {
-                return Some(0); // Signature has already expired
+                return Some(0);
             }
         }
     }
@@ -90,21 +83,6 @@ pub fn remaining_rrsig_validity(msg: &Message, now: u64) -> Option<u32> {
     }
 }
 
-/// Constructs a client-tailored DNS response from a canonical validated message.
-///
-/// Implements the unified response construction pipeline:
-/// 1. Injects client Transaction ID and echoes RD/CD flags.
-/// 2. Sets authoritative=false and recursion_available=true.
-/// 3. Computes the AD bit strictly per RFC 4035 §3.2.2/§3.2.3, RFC 6840 §5.7/§5.8, and RFC 8767 §6:
-///    - Requires DnssecStatus::Secure.
-///    - Requires fresh data (stale cache hits strictly set AD=0).
-///    - Requires client signaling interest via DO=1 or request AD=1.
-///    - Requires Checking Disabled to be clear (CD=0).
-/// 4. Decrements all Resource Record TTLs according to elapsed age (RFC 2181), skipping OPT.
-///    Applies RFC 8767 §4 positive 30s TTL when serving stale records.
-/// 5. Filters DNSSEC records (RRSIG, NSEC, NSEC3) if client DO=0 (RFC 4035 §3.2.1),
-///    unless the client explicitly queried for that specific record type.
-/// 6. Adds or suppresses the EDNS0 OPT record depending on whether the client sent EDNS.
 fn construct_client_response(
     base_msg: &Message,
     qtype: RecordType,
@@ -118,7 +96,6 @@ fn construct_client_response(
 ) -> Option<Vec<u8>> {
     let mut client_resp = Message::new();
 
-    // 1. Transaction ID and base header flags
     client_resp.set_id(req_msg.id());
     client_resp.set_message_type(MessageType::Response);
     client_resp.set_op_code(req_msg.op_code());
@@ -129,13 +106,12 @@ fn construct_client_response(
     client_resp.set_checking_disabled(req_msg.checking_disabled());
     client_resp.set_response_code(base_msg.response_code());
 
-    // Echo query section
     for q in req_msg.queries() {
         client_resp.add_query(q.clone());
     }
 
-    // 2. AD bit determination (RFC 4035 §3.2.2/3, RFC 6840 §5.7/8, RFC 8767 §6)
-    // The response builder does not validate RRSIGs; it relies on DnssecStatus and freshness.
+    // RFC 4035 §3.2.2/3, RFC 6840 §5.7/8, RFC 8767 §6:
+    // AD is asserted iff Secure, fresh, client signaled interest, and CD=0.
     let client_wants_ad = client_dnssec_ok || req_msg.authentic_data();
     let client_cd = req_msg.checking_disabled();
 
@@ -146,10 +122,8 @@ fn construct_client_response(
 
     client_resp.set_authentic_data(ad);
 
-    // 3. TTL aging and DO=0 presentation filtering
     let age = now.saturating_sub(cached_at) as u32;
 
-    // RFC 8767 §4: Fresh data gets aged TTL; stale data gets a positive 30-second TTL.
     let compute_ttl = |orig_ttl: u32| -> u32 {
         match freshness {
             CacheFreshness::Fresh => orig_ttl.saturating_sub(age),
@@ -158,7 +132,6 @@ fn construct_client_response(
         }
     };
 
-    // Answers section
     for r in base_msg.answers() {
         if !client_dnssec_ok && is_dnssec_record(r.record_type()) && r.record_type() != qtype {
             continue;
@@ -168,7 +141,6 @@ fn construct_client_response(
         client_resp.add_answer(rec);
     }
 
-    // Authority (Name Servers) section
     for r in base_msg.name_servers() {
         if !client_dnssec_ok && is_dnssec_record(r.record_type()) && r.record_type() != qtype {
             continue;
@@ -178,7 +150,6 @@ fn construct_client_response(
         client_resp.add_name_server(rec);
     }
 
-    // Additionals section (excluding OPT, which is managed via set_edns below)
     for r in base_msg.additionals() {
         if r.record_type() == RecordType::OPT {
             continue;
@@ -191,7 +162,6 @@ fn construct_client_response(
         client_resp.add_additional(rec);
     }
 
-    // 4. EDNS0 (OPT) handling (RFC 6891 §6.1.1)
     if req_msg.extensions().is_some() {
         let mut edns = Edns::new();
         edns.set_max_payload(client_max_payload as u16);
@@ -203,7 +173,6 @@ fn construct_client_response(
     client_resp.to_bytes().ok()
 }
 
-/// Detailed query processing pipeline returning a typed `ProcessOutcome`.
 pub async fn process_dns_query(
     req_wire: &[u8],
     state: &AppState,
@@ -217,7 +186,6 @@ pub async fn process_dns_query(
         Err(_) => return ProcessOutcome::Malformed,
     };
 
-    // RFC 1035 §4.1.2 & RFC 8906 §3.2: Reject messages not containing exactly one query.
     if req_msg.queries().len() != 1 {
         tracing::debug!(
             protocol,
@@ -240,7 +208,6 @@ pub async fn process_dns_query(
         None => (512, false),
     };
 
-    // Rate Limiting check
     match state.rate_limiter.check_query(protocol, client_ip, &qname, qtype) {
         RrlAction::Allow => {}
         RrlAction::Truncate => {
@@ -265,19 +232,13 @@ pub async fn process_dns_query(
         }
     }
 
-    // Canonical, client-agnostic cache key
     let cache_key = format!("{}:{}:IN", qname.to_ascii().to_lowercase(), qtype);
     let now = now_secs();
 
-    // ---------------------------------------------------------------------
-    // 1. Cache hit path
-    // ---------------------------------------------------------------------
     if let Some(entry) = state.cache.get(&cache_key) {
         let freshness = entry.freshness(now);
 
-        // Do not serve Expired records; fall through to synchronous resolution
         if freshness != CacheFreshness::Expired {
-            // Stale-While-Revalidate: serve stale while triggering background revalidation
             if freshness == CacheFreshness::Stale {
                 if state.in_flight.insert(cache_key.clone(), ()).is_none() {
                     let cache_clone = state.cache.clone();
@@ -367,7 +328,6 @@ pub async fn process_dns_query(
                     client_dnssec_ok,
                     now,
                 ) {
-                    // Post-tailoring size check
                     if state.rate_limiter.should_challenge_large_response(
                         protocol,
                         client_ip,
@@ -383,9 +343,6 @@ pub async fn process_dns_query(
         }
     }
 
-    // ---------------------------------------------------------------------
-    // 2. Cache miss path (or Expired stale fallback)
-    // ---------------------------------------------------------------------
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
             let dnssec_status = DnssecValidator::validate_message(
@@ -466,7 +423,6 @@ pub async fn process_dns_query(
                 );
             }
 
-            // Reconstruct client-tailored response
             let wire = match construct_client_response(
                 &resp_msg,
                 qtype,
@@ -491,7 +447,6 @@ pub async fn process_dns_query(
                 "[RESOLVED] Resolution completed"
             );
 
-            // Post-tailoring size check
             if state.rate_limiter.should_challenge_large_response(
                 protocol,
                 client_ip,
@@ -517,7 +472,6 @@ pub async fn process_dns_query(
     }
 }
 
-/// Standard entrypoint maintaining backward compatibility across all socket listeners.
 pub async fn process_dns_wire(
     req_wire: &[u8],
     state: &AppState,

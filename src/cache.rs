@@ -13,8 +13,6 @@ pub const DEFAULT_MAX_STALE_SECS: u64 = 300;
 /// RFC 8767 §4: Recommended small positive TTL (in seconds) when serving stale responses.
 pub const STALE_SERVE_TTL: u32 = 30;
 
-/// Retrieves the configured maximum allowable stale duration.
-/// Can be overridden via the `MAX_STALE_SECS` environment variable.
 pub fn max_stale_secs() -> u64 {
     static MAX_STALE: OnceLock<u64> = OnceLock::new();
     *MAX_STALE.get_or_init(|| {
@@ -25,15 +23,10 @@ pub fn max_stale_secs() -> u64 {
     })
 }
 
-/// Explicit lifecycle state of a cached DNS response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheFreshness {
-    /// Within authoritative TTL; immediately servable without background revalidation.
     Fresh,
-    /// Authoritative TTL has elapsed, but within the allowable stale-while-revalidate window.
-    /// Served to clients with a 30-second stale TTL and AD=0 while triggering background resolution.
     Stale,
-    /// Has exceeded the maximum stale window; must be discarded and never served.
     Expired,
 }
 
@@ -67,18 +60,14 @@ pub struct CacheEntry {
     pub min_ttl: u32,
     pub cached_at: u64,
     pub last_revalidated_at: u64,
-    /// Explicit, authoritative DNSSEC validation verdict for this cached RRset.
-    /// Required field: entries lacking this metadata are discarded on startup.
     pub dnssec_status: DnssecStatus,
 }
 
 impl CacheEntry {
-    /// Determines the freshness of this entry at the given timestamp.
     pub fn freshness(&self, now: u64) -> CacheFreshness {
         self.freshness_at(now, max_stale_secs())
     }
 
-    /// Evaluates freshness against an explicit stale window cutoff.
     pub fn freshness_at(&self, now: u64, max_stale: u64) -> CacheFreshness {
         let age = now.saturating_sub(self.cached_at);
         let ttl = self.min_ttl as u64;
@@ -106,9 +95,6 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Loads cached entries from disk, discarding any entries that:
-/// 1. Exceed their allowable stale lifetime (prevents zombie record resurrection).
-/// 2. Lack the explicit `dnssec_status` field (prevents downgrading historical Secure entries to Insecure).
 pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
     let path = path.as_ref();
     if !path.exists() {
@@ -118,7 +104,6 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
     match File::open(path) {
         Ok(file) => {
             let reader = BufReader::new(file);
-            // Read raw JSON map so we can validate each entry individually
             match serde_json::from_reader::<_, HashMap<String, serde_json::Value>>(reader) {
                 Ok(raw_entries) => {
                     let now = now_secs();
@@ -128,7 +113,6 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
                     let mut discarded_legacy = 0;
 
                     for (k, val) in raw_entries {
-                        // Discard legacy entries that lack the explicit dnssec_status field
                         let entry: CacheEntry = match serde_json::from_value(val) {
                             Ok(e) => e,
                             Err(_) => {
@@ -137,7 +121,6 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
                             }
                         };
 
-                        // Discard entries whose allowable stale lifetime has expired
                         if entry.freshness_at(now, max_stale) == CacheFreshness::Expired {
                             discarded_expired += 1;
                             continue;
@@ -173,8 +156,6 @@ pub async fn save_cache_to_disk_async(cache: DnsCache, path: String) {
     .unwrap_or_default();
 }
 
-/// Atomically persists the in-memory cache to disk, filtering out expired entries
-/// so dead or expired records are not written to JSON storage.
 pub fn save_cache_to_disk_sync<P: AsRef<Path>>(cache: &DnsCache, path: P) {
     let path = path.as_ref();
     let tmp_path = path.with_extension("tmp");

@@ -22,11 +22,11 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-const PER_VALIDATION_MAX_SIG_CHECKS: usize = 24; // Per-validation cryptographic budget against KeyTrap (CVE-2023-50387)
-const MAX_NEGATIVE_RECORDS: usize = 8;           // Cap NSEC/NSEC3 records processed
-const MAX_NSEC3_ITERATIONS: u16 = 150;           // RFC 9276 recommendation
-const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;    // Bounded walk
-const MAX_CNAME_CHAIN: usize = 16;               // Bounded CNAME/DNAME chain walk
+const PER_VALIDATION_MAX_SIG_CHECKS: usize = 24;
+const MAX_NEGATIVE_RECORDS: usize = 8;
+const MAX_NSEC3_ITERATIONS: u16 = 150;
+const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;
+const MAX_CNAME_CHAIN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DnssecStatus {
@@ -236,9 +236,6 @@ impl DnssecValidator {
                         other => return other,
                     }
 
-                    // RFC 6672 §5.3: The synthesized CNAME from a DNAME is not an independently
-                    // signed authoritative RRset. If an RRSIG is present for it, validate it;
-                    // otherwise, do not require an RRSIG.
                     let synth_cname_records: Vec<Record> = all_records
                         .iter()
                         .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
@@ -464,7 +461,6 @@ impl DnssecValidator {
             }
         };
 
-        // If the answer section contains a CNAME chain, the SOA applies to the final target
         let final_target = msg
             .answers()
             .iter()
@@ -511,8 +507,7 @@ impl DnssecValidator {
 
         let authority: Vec<Record> = msg.name_servers().to_vec();
 
-        // Point 11: RFC 4035 §5.4: An authenticated negative response in a signed zone MUST include
-        // an authenticated SOA RRset. Verify that the SOA in authority is validly signed by the zone keys.
+        // Point 11: Authenticate the SOA RRset as required by RFC 4035 §5.4
         if let Some(soa_rec) = soa {
             if !Self::verify_negative_rrset(soa_rec, &authority, &keys, budget) {
                 tracing::warn!(
@@ -712,12 +707,8 @@ impl DnssecValidator {
             return status;
         }
 
-        // Find Closest Provable Encloser
         let mut closest = find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations);
 
-        // RFC 5155 §8.4: For DS queries at an insecure delegation, the parent apex is already known
-        // to exist. If the parent authority omitted the apex NSEC3 record and only provided the
-        // covering Opt-Out NSEC3 record, the closest encloser is the parent apex (qname.base_name()).
         if closest.is_none() && qtype == RecordType::DS {
             closest = Some(qname.base_name());
         }
@@ -1030,8 +1021,6 @@ impl DnssecValidator {
             };
             last_ttl = effective_ttl;
 
-            // RFC 4035 §5.2: Authenticate all keys in the verified DNSKEY RRset
-            // that possess the Zone Key flag (bit 7 = 1).
             let authenticated_zone_keys: Vec<DNSKEY> = candidates
                 .into_iter()
                 .filter(|k| (k.flags() & 0x0100) != 0)
@@ -1096,10 +1085,6 @@ impl DnssecValidator {
         dnskey.public_key().verify(&tbs, rrsig.sig()).is_ok()
     }
 }
-
-// -------------------------------------------------------------------------
-// Decomposed NSEC Proof Types (RFC 4035 §5.4)
-// -------------------------------------------------------------------------
 
 fn find_nsec_closest_encloser(qname: &Name, nsec_records: &[&Record]) -> Option<Name> {
     let mut cur = if qname.is_root() {
@@ -1213,10 +1198,6 @@ fn check_nsec_nxdomain(
     Some(DnssecStatus::Secure)
 }
 
-// -------------------------------------------------------------------------
-// Decomposed NSEC3 Proof Types (RFC 5155 §8)
-// -------------------------------------------------------------------------
-
 fn find_nsec3_closest_provable_encloser(
     qname: &Name,
     nsec3_records: &[&Record],
@@ -1327,9 +1308,6 @@ fn check_nsec3_nxdomain(
         _ => false,
     };
 
-    // RFC 5155 §8.4 & §8.5: An Opt-Out NSEC3 record only proves InsecureUnsigned
-    // if the query is for a DS record at an insecure delegation boundary.
-    // For normal RR queries, an Opt-Out record does NOT turn an NXDOMAIN into Insecure.
     if is_opt_out && qtype == RecordType::DS {
         tracing::debug!(
             qname = %qname,
@@ -1351,21 +1329,11 @@ fn check_nsec3_nxdomain(
     Some(DnssecStatus::Secure)
 }
 
-// -------------------------------------------------------------------------
-// Helper functions
-// -------------------------------------------------------------------------
-
-/// RFC 4034 §3.1.5: Validates RRSIG signature expiration and inception timestamps
-/// using RFC 1982 serial number arithmetic over 32-bit values.
 fn rrsig_time_valid(sig: &RRSIG, now: u64) -> bool {
     let exp = sig.sig_expiration().get();
     let inc = sig.sig_inception().get();
     let now32 = (now & 0xFFFF_FFFF) as u32;
 
-    // RFC 1982 serial number arithmetic comparisons:
-    // (now32 - inc) >= 0  => inception is before or at current time
-    // (exp - now32) >= 0  => expiration is after or at current time
-    // (exp - inc) > 0     => inception is strictly before expiration
     (now32.wrapping_sub(inc) as i32) >= 0
         && (exp.wrapping_sub(now32) as i32) >= 0
         && (exp.wrapping_sub(inc) as i32) > 0
@@ -1586,7 +1554,6 @@ fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
     }
 }
 
-/// RFC 5155 §5: IH(salt, x, 0) = H(x | salt)
 fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     let mut wire = Vec::new();
     for label in name.iter() {
@@ -1596,7 +1563,6 @@ fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     }
     wire.push(0);
 
-    // Name (wire) MUST come first, then salt
     wire.extend_from_slice(salt);
     let mut hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &wire)
         .as_ref()
@@ -1714,7 +1680,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
     out.extend_from_slice(&rrsig.sig_inception().get().to_be_bytes());
     out.extend_from_slice(&rrsig.key_tag().to_be_bytes());
 
-    // RFC 4034 §3.1.8.1: Signer name MUST be canonical lowercase in wire format
     {
         let mut name_buf = Vec::new();
         let mut encoder = BinEncoder::new(&mut name_buf);
@@ -1734,7 +1699,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
         owner.clone()
     };
 
-    // RFC 4034 §6.2: Owner name MUST be canonical lowercase in wire format
     let canonical_owner = canonical_owner_raw.to_lowercase();
 
     struct CanonicalEntry {
