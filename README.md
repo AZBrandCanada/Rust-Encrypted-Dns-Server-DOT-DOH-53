@@ -370,8 +370,8 @@ Validation covers both positive and negative DNS responses.
 
 The resolver includes the current root trust anchors:
 
-* Root KSK-2017 — Key Tag `20326`
-* Root KSK-2024 — Key Tag `38696`
+* Root KSK-2017, Key Tag `20326`
+* Root KSK-2024, Key Tag `38696`
 
 Root and intermediate authentication failures are treated as validation failures.
 
@@ -876,7 +876,7 @@ The resolver handles `TC=1` responses by retrying the query over TCP.
 
 # Deployment
 
-## Option A — Standalone Deployment
+## Option A, Standalone Deployment
 
 The resolver can terminate DoT and DoH TLS directly.
 
@@ -926,7 +926,7 @@ sudo systemctl enable --now doh-server.service
 
 ---
 
-## Option B — Reverse Proxy Deployment
+## Option B, Reverse Proxy Deployment
 
 A reverse proxy can terminate public HTTPS while the resolver listens locally in HTTP mode.
 
