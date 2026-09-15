@@ -267,9 +267,9 @@ async fn bind_tcp(
 
 /// Pre-warms the cache with canonical, client-agnostic validated DNS responses.
 ///
-/// Stores canonical data under `{name}:{qtype}:IN` without fabricating client headers
-/// (ID, RD, CD, DO), allowing `src/engine.rs` to dynamically construct appropriate
-/// client-facing wire responses on demand.
+/// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
+/// (ID, RD, CD, DO) cleared, allowing `src/engine.rs` to dynamically construct appropriate
+/// client-tailored wire responses on demand.
 async fn preload_domains(
     cache: DnsCache,
     recursor: Arc<RecursiveResolver>,
@@ -334,10 +334,12 @@ async fn preload_domains(
                                 continue;
                             }
 
-                            // Neutralize client-specific flags on the canonical cached response
+                            // Neutralize all client-specific header flags on the canonical cached response
                             msg.set_id(0);
                             msg.set_authoritative(false);
                             msg.set_recursion_available(true);
+                            msg.set_recursion_desired(false);
+                            msg.set_checking_disabled(false);
                             msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
 
                             if let Ok(wire) = msg.to_bytes() {

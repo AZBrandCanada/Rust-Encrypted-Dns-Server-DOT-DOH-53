@@ -42,6 +42,7 @@ async fn handle_doh_options() -> Response {
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         "content-type, accept".parse().unwrap(),
     );
+    headers.insert(header::ACCESS_CONTROL_MAX_AGE, "86400".parse().unwrap());
     (StatusCode::OK, headers, ()).into_response()
 }
 
@@ -53,21 +54,43 @@ async fn handle_doh_get(
     headers: HeaderMap,
     Query(params): Query<DohQuery>,
 ) -> Response {
+    // RFC 8484 §4.2.1: Verify Accept header if provided by the client
+    if !is_acceptable_media_type(&headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept header must include application/dns-message or */*",
+        )
+            .into_response();
+    }
+
+    // Distinguish missing parameter vs empty parameter
     let encoded = match params.dns {
-        Some(ref d) if !d.trim().is_empty() => d.trim(),
-        _ => {
+        None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "Missing or empty 'dns' query parameter",
+                "Missing 'dns' query parameter",
             )
                 .into_response()
         }
+        Some(ref d) if d.trim().is_empty() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Empty 'dns' query parameter",
+            )
+                .into_response()
+        }
+        Some(ref d) => d.trim(),
     };
 
+    // Decode base64url DNS wire bytes
     let raw_bytes = match decode_dns_param(encoded) {
-        Ok(b) if !b.is_empty() => b,
-        Ok(_) => return (StatusCode::BAD_REQUEST, "Empty DNS query payload").into_response(),
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response(),
+        Ok(b) if b.is_empty() => {
+            return (StatusCode::BAD_REQUEST, "Empty decoded DNS query payload").into_response()
+        }
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response()
+        }
     };
 
     if raw_bytes.len() > MAX_DOH_PAYLOAD {
@@ -88,6 +111,31 @@ async fn handle_doh_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // RFC 8484 §4.1: POST requires Content-Type: application/dns-message.
+    // Check Content-Type first before examining payload content.
+    let ct_valid = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.trim().to_ascii_lowercase().starts_with("application/dns-message"))
+        .unwrap_or(false);
+
+    if !ct_valid {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/dns-message",
+        )
+            .into_response();
+    }
+
+    // RFC 8484 §4.2.1: Verify Accept header if provided
+    if !is_acceptable_media_type(&headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept header must include application/dns-message or */*",
+        )
+            .into_response();
+    }
+
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty request body").into_response();
     }
@@ -96,21 +144,21 @@ async fn handle_doh_post(
         return (StatusCode::PAYLOAD_TOO_LARGE, "DNS query exceeds size limit").into_response();
     }
 
-    // RFC 8484 §4.1: POST requires Content-Type: application/dns-message
-    match headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
-        Some(ct) if ct.starts_with("application/dns-message") => {}
-        _ => {
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Content-Type must be application/dns-message",
-            )
-                .into_response()
-        }
-    }
-
     let client_ip = extract_client_ip(&headers, &peer);
     let outcome = process_dns_query(&body, &state, "DoH", client_ip).await;
     handle_dns_outcome(outcome)
+}
+
+/// Checks whether the client's Accept header is compatible with application/dns-message.
+fn is_acceptable_media_type(headers: &HeaderMap) -> bool {
+    if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        let accept = accept.trim().to_ascii_lowercase();
+        accept.contains("application/dns-message")
+            || accept.contains("*/*")
+            || accept.contains("application/*")
+    } else {
+        true
+    }
 }
 
 /// Maps internal DNS engine outcomes to strict RFC 8484 HTTP responses.

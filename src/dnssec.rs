@@ -21,11 +21,11 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-const GLOBAL_MAX_SIG_CHECKS: usize = 24;      // Global budget against KeyTrap (CVE-2023-50387)
-const MAX_NEGATIVE_RECORDS: usize = 8;        // Cap NSEC/NSEC3 records processed
-const MAX_NSEC3_ITERATIONS: u16 = 150;        // RFC 9276 recommendation
-const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16; // Bounded walk
-const MAX_CNAME_CHAIN: usize = 16;            // Bounded CNAME/DNAME chain walk
+const PER_VALIDATION_MAX_SIG_CHECKS: usize = 24; // Per-validation cryptographic budget against KeyTrap (CVE-2023-50387)
+const MAX_NEGATIVE_RECORDS: usize = 8;           // Cap NSEC/NSEC3 records processed
+const MAX_NSEC3_ITERATIONS: u16 = 150;           // RFC 9276 recommendation
+const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;    // Bounded walk
+const MAX_CNAME_CHAIN: usize = 16;               // Bounded CNAME/DNAME chain walk
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
@@ -52,7 +52,7 @@ impl Default for ValidationBudget {
     fn default() -> Self {
         Self {
             sig_checks: 0,
-            max_sig_checks: GLOBAL_MAX_SIG_CHECKS,
+            max_sig_checks: PER_VALIDATION_MAX_SIG_CHECKS,
         }
     }
 }
@@ -235,13 +235,23 @@ impl DnssecValidator {
                         other => return other,
                     }
 
+                    // RFC 6672 §5.3: The synthesized CNAME from a DNAME is not an independently
+                    // signed authoritative RRset. If an RRSIG is present for it, validate it;
+                    // otherwise, do not require an RRSIG.
                     let synth_cname_records: Vec<Record> = all_records
                         .iter()
                         .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
                         .cloned()
                         .collect();
 
-                    if !synth_cname_records.is_empty() {
+                    let has_rrsig = all_records.iter().any(|r| match r.data() {
+                        RData::DNSSEC(DNSSECRData::RRSIG(sig)) => {
+                            sig.type_covered() == RecordType::CNAME && r.name() == input_name
+                        }
+                        _ => false,
+                    });
+
+                    if !synth_cname_records.is_empty() && has_rrsig {
                         match Self::validate_rrset(
                             recursor,
                             input_name,
@@ -385,7 +395,7 @@ impl DnssecValidator {
                         if !budget.can_check_sig() {
                             tracing::warn!(
                                 name = %owner,
-                                "[DNSSEC] Exceeded global signature budget (KeyTrap protection); Bogus"
+                                "[DNSSEC] Exceeded per-validation signature budget (KeyTrap protection); Bogus"
                             );
                             return DnssecStatus::Bogus;
                         }
@@ -453,9 +463,7 @@ impl DnssecValidator {
             }
         };
 
-        // Determine the target name being evaluated for negative existence:
-        // If the answer section contains a CNAME chain, the SOA in the authority
-        // section applies to the final CNAME target, not the initial query name.
+        // If the answer section contains a CNAME chain, the SOA applies to the final target
         let final_target = msg
             .answers()
             .iter()
@@ -470,7 +478,6 @@ impl DnssecValidator {
             })
             .unwrap_or_else(|| qname.clone());
 
-        // Zone boundary check: SOA must be authoritative for the final target
         if !zone.zone_of(&final_target) && zone != final_target && !zone.zone_of(qname) && zone != *qname {
             tracing::warn!(
                 zone = %zone,
@@ -1293,11 +1300,14 @@ fn check_nsec3_nxdomain(
         _ => false,
     };
 
-    if is_opt_out {
+    // RFC 5155 §8.4 & §8.5: An Opt-Out NSEC3 record only proves InsecureUnsigned
+    // if the query is for a DS record at an insecure delegation boundary.
+    // For normal RR queries, an Opt-Out record does NOT turn an NXDOMAIN into Insecure.
+    if is_opt_out && qtype == RecordType::DS {
         tracing::debug!(
             qname = %qname,
             qtype = ?qtype,
-            "[DNSSEC] Opt-Out NSEC3 covers next-closer; proves insecure delegation"
+            "[DNSSEC] Opt-Out NSEC3 covers next-closer for DS query; proves insecure delegation"
         );
         return Some(DnssecStatus::InsecureUnsigned);
     }
@@ -1318,10 +1328,20 @@ fn check_nsec3_nxdomain(
 // Helper functions
 // -------------------------------------------------------------------------
 
+/// RFC 4034 §3.1.5: Validates RRSIG signature expiration and inception timestamps
+/// using RFC 1982 serial number arithmetic over 32-bit values.
 fn rrsig_time_valid(sig: &RRSIG, now: u64) -> bool {
-    let exp = sig.sig_expiration().get() as u64;
-    let inc = sig.sig_inception().get() as u64;
-    now >= inc && now <= exp
+    let exp = sig.sig_expiration().get();
+    let inc = sig.sig_inception().get();
+    let now32 = (now & 0xFFFF_FFFF) as u32;
+
+    // RFC 1982 serial number arithmetic comparisons:
+    // (now32 - inc) >= 0  => inception is before or at current time
+    // (exp - now32) >= 0  => expiration is after or at current time
+    // (exp - inc) > 0     => inception is strictly before expiration
+    (now32.wrapping_sub(inc) as i32) >= 0
+        && (exp.wrapping_sub(now32) as i32) >= 0
+        && (exp.wrapping_sub(inc) as i32) > 0
 }
 
 fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChainResult {

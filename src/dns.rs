@@ -13,6 +13,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Active I/O timeout for completing an in-progress frame read/write.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum UDP datagram size (65,535 bytes).
+/// Sizing the socket receive buffer to 64KB ensures the OS kernel never silently
+/// truncates oversized incoming datagrams to a smaller user-space buffer.
+const MAX_UDP_RECV_BUF: usize = 65535;
+
+/// RFC 6891 §6.2.3: Standard maximum allowable UDP query payload size.
+const MAX_UDP_QUERY_SIZE: usize = 4096;
+
 /// RFC 7766 §8: The 2-byte length field permits messages up to 65,535 bytes (64 KB).
 /// This is essential for post-quantum ML-DSA-44 and large DNSSEC key sets.
 const MAX_TCP_MSG_SIZE: usize = 65535;
@@ -27,12 +35,25 @@ pub async fn run_udp_listener(
     state: AppState,
     concurrency_limit: Arc<Semaphore>,
 ) {
-    let mut buf = vec![0u8; 4096];
+    // 64 KB receive buffer guarantees the OS will never partially deliver/truncate
+    // an incoming UDP datagram to fit into user-space.
+    let mut buf = vec![0u8; MAX_UDP_RECV_BUF];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, peer)) => {
                 // Reject undersized datagrams without processing
                 if len < MIN_DNS_MSG_SIZE {
+                    continue;
+                }
+
+                // If a datagram exceeds standard DNS UDP limits, reject it rather
+                // than treating an oversized packet as valid.
+                if len > MAX_UDP_QUERY_SIZE {
+                    tracing::debug!(
+                        len,
+                        client = %peer.ip(),
+                        "[UDP] Datagram exceeds maximum DNS UDP query size; dropping"
+                    );
                     continue;
                 }
 
@@ -118,7 +139,7 @@ pub async fn handle_length_prefixed_stream<S>(
         let read_len = timeout(IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await;
         let req_len = match read_len {
             Ok(Ok(2)) => u16::from_be_bytes(len_buf) as usize,
-            _ => break, // Connection closed cleanly or idle timeout expired
+            _ => break, // Connection closed cleanly, unexpected EOF, or idle timeout expired
         };
 
         // RFC 7766 §8: Validate framing length.
@@ -134,9 +155,11 @@ pub async fn handle_length_prefixed_stream<S>(
             break;
         }
 
-        // 2. Read the full DNS query payload with an active I/O timeout
+        // 2. Read the full DNS query payload with an active I/O timeout.
+        // Verify both timer completion and underlying I/O success.
         let mut req_buf = vec![0u8; req_len];
-        if timeout(IO_TIMEOUT, stream.read_exact(&mut req_buf)).await.is_err() {
+        let read_payload = timeout(IO_TIMEOUT, stream.read_exact(&mut req_buf)).await;
+        if !matches!(read_payload, Ok(Ok(_))) {
             break;
         }
 
@@ -166,7 +189,7 @@ pub async fn handle_length_prefixed_stream<S>(
                 })
                 .await;
 
-                if write_result.is_err() {
+                if !matches!(write_result, Ok(Ok(()))) {
                     break;
                 }
             }

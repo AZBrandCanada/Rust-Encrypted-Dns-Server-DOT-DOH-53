@@ -70,7 +70,12 @@ fn is_dnssec_record(rtype: RecordType) -> bool {
 /// Implements the unified response construction pipeline:
 /// 1. Injects client Transaction ID and echoes RD/CD flags.
 /// 2. Sets authoritative=false and recursion_available=true.
-/// 3. Computes the AD bit strictly per RFC 4035 §3.2.3, RFC 6840 §5.7, and RFC 8767 §6.
+/// 3. Computes the AD bit strictly per RFC 4035 §3.2.2/§3.2.3, RFC 6840 §5.7/§5.8, and RFC 8767 §6:
+///    - Requires DnssecStatus::Secure.
+///    - Requires fresh data (stale cache hits MUST NOT set AD).
+///    - Requires unexpired signatures.
+///    - Requires client signaling interest via DO=1 or request AD=1.
+///    - Requires Checking Disabled to be clear (CD=0).
 /// 4. Decrements all Resource Record TTLs according to elapsed age (RFC 2181), skipping OPT.
 /// 5. Filters DNSSEC records (RRSIG, NSEC, NSEC3) if client DO=0 (RFC 4035 §3.2.1),
 ///    unless the client explicitly queried for that specific record type.
@@ -118,11 +123,22 @@ fn construct_client_response(
             }
         });
 
-    // RFC 4035 §3.2.3 / RFC 6840 §5.7: AD set iff fully validated Secure.
+    // RFC 6840 §5.7 & §5.8: The client signals interest in AD either via EDNS DO=1
+    // or by setting the AD bit in the request header. If neither was set, AD MUST NOT be set.
+    let client_wants_ad = client_dnssec_ok || req_msg.authentic_data();
+
+    // RFC 4035 §3.2.2: A query with CD=1 indicates checking disabled; the resolver
+    // MUST NOT assert AD=1 in the response.
+    let client_cd = req_msg.checking_disabled();
+
+    // RFC 4035 §3.2.3 / RFC 6840 §5.7 & §5.8: AD set iff fully validated Secure,
+    // client asked/signaled interest, CD is clear, and signatures are current.
     // RFC 8767 §6: Responses served from stale cache MUST NOT set AD.
     let ad = dnssec_status == DnssecStatus::Secure
         && freshness == CacheFreshness::Fresh
-        && !any_rrsig_expired;
+        && !any_rrsig_expired
+        && client_wants_ad
+        && !client_cd;
 
     client_resp.set_authentic_data(ad);
 
@@ -190,11 +206,19 @@ pub async fn process_dns_query(
         Err(_) => return ProcessOutcome::Malformed,
     };
 
-    let query = match req_msg.queries().first() {
-        Some(q) => q,
-        None => return ProcessOutcome::Malformed,
-    };
+    // RFC 1035 §4.1.2 & RFC 8906 §3.2: Standard DNS requires exactly one question.
+    // If the request contains 0 or more than 1 question, reject as Malformed.
+    if req_msg.queries().len() != 1 {
+        tracing::debug!(
+            protocol,
+            client = %client_ip,
+            query_count = req_msg.queries().len(),
+            "[DNS] Request does not contain exactly one question; rejecting as Malformed"
+        );
+        return ProcessOutcome::Malformed;
+    }
 
+    let query = &req_msg.queries()[0];
     let qname = query.name().clone();
     let qtype = query.query_type();
 
@@ -241,7 +265,7 @@ pub async fn process_dns_query(
     if let Some(entry) = state.cache.get(&cache_key) {
         let freshness = entry.freshness(now);
 
-        // Problem 2 & 3: Do not serve Expired records; fall through to synchronous resolution
+        // Do not serve Expired records; fall through to synchronous resolution
         if freshness != CacheFreshness::Expired {
             // Stale-While-Revalidate: serve stale while triggering background revalidation
             if freshness == CacheFreshness::Stale {

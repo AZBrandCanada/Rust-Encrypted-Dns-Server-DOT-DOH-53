@@ -95,7 +95,7 @@ impl RateLimiter {
         bucket.last_seen_millis.store(now_ms, Ordering::Relaxed);
 
         // Thread-safe atomic token bucket refill
-        let last_refill = bucket.last_refill_millis.load(Ordering::Relaxed);
+        let last_refill = bucket.last_refill_millis.load(Ordering::Acquire);
         let elapsed_ms = (now_ms - last_refill).max(0);
         if elapsed_ms > 0 {
             let new_tokens = (elapsed_ms * self.refill_per_sec) / 1000;
@@ -114,12 +114,16 @@ impl RateLimiter {
             }
         }
 
-        // Check token availability
-        let current_tokens = bucket.tokens.load(Ordering::Relaxed);
-        if current_tokens <= 0 {
+        // Atomically verify and consume a token; prevents tokens from going negative under contention
+        let token_acquired = bucket.tokens.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |curr| if curr > 0 { Some(curr - 1) } else { None },
+        );
+
+        if token_acquired.is_err() {
             return RrlAction::Drop;
         }
-        bucket.tokens.fetch_sub(1, Ordering::Relaxed);
 
         // TCP, DoT, and DoH only use the subnet token bucket
         if protocol != "UDP" {
@@ -142,20 +146,26 @@ impl RateLimiter {
             penalized_until_sec: AtomicI64::new(0),
         });
 
-        let penalty = domain_entry.penalized_until_sec.load(Ordering::Relaxed);
+        let penalty = domain_entry.penalized_until_sec.load(Ordering::Acquire);
         if now_s < penalty {
-            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Relaxed);
+            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Release);
             return RrlAction::Drop;
         }
 
-        let last_seen = domain_entry.last_seen_sec.load(Ordering::Relaxed);
+        let last_seen = domain_entry.last_seen_sec.load(Ordering::Acquire);
         if now_s > last_seen {
-            domain_entry.count.store(1, Ordering::Relaxed);
-            domain_entry.last_seen_sec.store(now_s, Ordering::Relaxed);
-            return RrlAction::Allow;
+            // Only the winning thread in a new second resets the count
+            if domain_entry
+                .last_seen_sec
+                .compare_exchange(last_seen, now_s, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                domain_entry.count.store(1, Ordering::Release);
+                return RrlAction::Allow;
+            }
         }
 
-        let query_count = domain_entry.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let query_count = domain_entry.count.fetch_add(1, Ordering::AcqRel) + 1;
 
         if query_count == 1 {
             RrlAction::Allow
@@ -163,7 +173,7 @@ impl RateLimiter {
             // Force client to prove authentic IP via TCP handshake (mitigates IP spoofing)
             RrlAction::Truncate
         } else {
-            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Relaxed);
+            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Release);
             RrlAction::Drop
         }
     }

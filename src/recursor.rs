@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::rdata::CNAME;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 use rand::seq::SliceRandom;
@@ -225,7 +226,9 @@ fn merge_redirection_response(
     }
 
     for r in final_msg.answers() {
-        final_response.add_answer(r.clone());
+        if !final_response.answers().iter().any(|existing| existing == r) {
+            final_response.add_answer(r.clone());
+        }
     }
 
     for r in final_msg.name_servers() {
@@ -272,7 +275,6 @@ impl RecursiveResolver {
                 .unwrap_or_else(|| ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect());
             let mut current_servers: Vec<SocketAddr> =
                 start_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
-            current_servers.shuffle(&mut rand::thread_rng());
 
             let mut last_zone: Option<Name> = None;
             let mut bailiwick: Name = Name::root();
@@ -307,25 +309,55 @@ impl RecursiveResolver {
                         }
                     });
 
-                    if let Some(target) = cname_target {
-                        let target_in_answers = response
-                            .answers()
-                            .iter()
-                            .any(|r| r.name() == &target && r.record_type() == rtype);
+                    if let Some(first_target) = cname_target {
+                        let mut current_target = first_target;
+                        let mut cname_seen = HashSet::new();
+                        cname_seen.insert(name.to_string().to_lowercase());
 
-                        if target_in_answers {
-                            return Ok(response);
+                        // Follow intra-response CNAME chain as far as possible
+                        loop {
+                            let key = current_target.to_string().to_lowercase();
+                            if !cname_seen.insert(key) {
+                                tracing::warn!(target = %current_target, "[RECURSOR] CNAME loop in answer section; aborting");
+                                return Err(RecursorError::NoProgress);
+                            }
+
+                            let target_in_answers = response
+                                .answers()
+                                .iter()
+                                .any(|r| r.name() == &current_target && r.record_type() == rtype);
+
+                            if target_in_answers {
+                                return Ok(response);
+                            }
+
+                            let next_cname = response.answers().iter().find_map(|r| {
+                                if r.name() == &current_target && r.record_type() == RecordType::CNAME {
+                                    if let RData::CNAME(cname) = r.data() {
+                                        Some(cname.0.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            });
+
+                            match next_cname {
+                                Some(next) => current_target = next,
+                                None => break,
+                            }
                         }
 
-                        let key = format!("cname:{}", target.to_string().to_lowercase());
+                        let key = format!("cname:{}", current_target.to_string().to_lowercase());
                         if visited.contains(&key) {
-                            tracing::warn!(target = %target, "[RECURSOR] CNAME loop detected; aborting");
+                            tracing::warn!(target = %current_target, "[RECURSOR] CNAME loop detected; aborting");
                             return Err(RecursorError::NoProgress);
                         }
                         visited.insert(key);
 
                         let cname_resp = self
-                            .resolve_internal(&target, rtype, depth + 1, visited)
+                            .resolve_internal(&current_target, rtype, depth + 1, visited)
                             .await?;
 
                         return Ok(merge_redirection_response(name, rtype, &response, cname_resp));
@@ -335,15 +367,38 @@ impl RecursiveResolver {
                     let dname_match = response.answers().iter().find_map(|r| {
                         if r.record_type() == DNAME_RECORD_TYPE && r.name().zone_of(name) && r.name() != name {
                             if let Some(target) = extract_dname_target(r) {
-                                return Some((r.name().clone(), target));
+                                return Some((r.name().clone(), target, r.ttl()));
                             }
                         }
                         None
                     });
 
-                    if let Some((dname_owner, target)) = dname_match {
+                    if let Some((dname_owner, target, dname_ttl)) = dname_match {
                         match dname_substitute(name, &dname_owner, &target) {
                             Ok(substituted) => {
+                                let has_synth_cname = response.answers().iter().any(|r| {
+                                    r.name() == name && r.record_type() == RecordType::CNAME
+                                });
+
+                                let mut working_response = response.clone();
+                                if !has_synth_cname {
+                                    let synth = Record::from_rdata(
+                                        name.clone(),
+                                        dname_ttl,
+                                        RData::CNAME(CNAME(substituted.clone())),
+                                    );
+                                    working_response.add_answer(synth);
+                                }
+
+                                let substituted_in_answers = working_response
+                                    .answers()
+                                    .iter()
+                                    .any(|r| r.name() == &substituted && r.record_type() == rtype);
+
+                                if substituted_in_answers {
+                                    return Ok(working_response);
+                                }
+
                                 let key = format!("dname:{}", substituted.to_string().to_lowercase());
                                 if visited.contains(&key) {
                                     tracing::warn!(target = %substituted, "[RECURSOR] DNAME loop detected; aborting");
@@ -355,7 +410,7 @@ impl RecursiveResolver {
                                     .resolve_internal(&substituted, rtype, depth + 1, visited)
                                     .await?;
 
-                                return Ok(merge_redirection_response(name, rtype, &response, dname_resp));
+                                return Ok(merge_redirection_response(name, rtype, &working_response, dname_resp));
                             }
                             Err(ResponseCode::YXDomain) => {
                                 tracing::warn!(
@@ -372,7 +427,7 @@ impl RecursiveResolver {
                         }
                     }
 
-                    return Ok(response);
+                    // Fall through to classify as authoritative terminal response or referral.
                 }
 
                 // 2. Authoritative terminal responses
@@ -396,7 +451,14 @@ impl RecursiveResolver {
 
                 // 3. Referral processing
                 if response.name_servers().is_empty() {
-                    return Ok(response);
+                    if response.authoritative() {
+                        return Ok(response);
+                    }
+                    tracing::warn!(
+                        name = %name,
+                        "[RECURSOR] Received non-authoritative response with no relevant answers and no delegation; invalid"
+                    );
+                    return Err(RecursorError::NoProgress);
                 }
 
                 let first_ns = response
@@ -577,6 +639,9 @@ impl RecursiveResolver {
         None
     }
 
+    /// Queries servers in concurrent batches of 3, prioritizing IPv4 to avoid
+    /// failing prematurely on networks without IPv6 routes. Walks through all candidates
+    /// until a valid answer is obtained.
     async fn query_servers_with_fallback(
         servers: &[SocketAddr],
         name: &Name,
@@ -586,34 +651,27 @@ impl RecursiveResolver {
             return None;
         }
 
-        let batch_size = 3;
-        let candidates: Vec<SocketAddr> = servers.iter().take(batch_size).cloned().collect();
-        let mut set = JoinSet::new();
-        for addr in candidates {
-            let name = name.clone();
-            set.spawn(async move { Self::query_socket(addr, &name, rtype).await });
+        // Shuffle within address families, but place IPv4 first to guarantee
+        // reliability on systems without working IPv6 routes.
+        let mut v4: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv4()).cloned().collect();
+        let mut v6: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv6()).cloned().collect();
+        {
+            v4.shuffle(&mut rand::thread_rng());
+            v6.shuffle(&mut rand::thread_rng());
         }
 
-        while let Some(joined) = set.join_next().await {
-            if let Ok(Ok(msg)) = joined {
-                match msg.response_code() {
-                    ResponseCode::NoError | ResponseCode::NXDomain => {
-                        return Some(msg);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let mut prioritized_servers = v4;
+        prioritized_servers.extend(v6);
 
-        if servers.len() > batch_size {
-            let fallback: Vec<SocketAddr> = servers.iter().skip(batch_size).take(batch_size).cloned().collect();
-            let mut fallback_set = JoinSet::new();
-            for addr in fallback {
+        // Iterate through all candidate servers in chunks of 3
+        for chunk in prioritized_servers.chunks(3) {
+            let mut set = JoinSet::new();
+            for &addr in chunk {
                 let name = name.clone();
-                fallback_set.spawn(async move { Self::query_socket(addr, &name, rtype).await });
+                set.spawn(async move { Self::query_socket(addr, &name, rtype).await });
             }
 
-            while let Some(joined) = fallback_set.join_next().await {
+            while let Some(joined) = set.join_next().await {
                 if let Ok(Ok(msg)) = joined {
                     match msg.response_code() {
                         ResponseCode::NoError | ResponseCode::NXDomain => {
@@ -661,8 +719,19 @@ impl RecursiveResolver {
         let req_bytes = query_msg.to_bytes()?;
 
         let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-        let socket = UdpSocket::bind(bind_addr).await?;
-        socket.connect(addr).await?;
+        let socket = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(ip = %addr.ip(), error = %e, "[RECURSOR] Failed to bind local socket for upstream query");
+                return Err(RecursorError::AllNameserversFailed);
+            }
+        };
+
+        if let Err(e) = socket.connect(addr).await {
+            tracing::debug!(ip = %addr.ip(), error = %e, "[RECURSOR] Failed to connect to upstream IP (e.g. network unreachable)");
+            return Err(RecursorError::AllNameserversFailed);
+        }
+
         socket.send(&req_bytes).await?;
 
         let mut buf = vec![0u8; 4096];
