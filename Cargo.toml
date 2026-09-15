@@ -1,7 +1,7 @@
 # Cargo.toml
 [package]
 name = "unified-dns"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "A high-performance iterative recursive DNS resolver supporting DNS, DNS over TLS, and DNS over HTTPS."
 license = "MIT"
