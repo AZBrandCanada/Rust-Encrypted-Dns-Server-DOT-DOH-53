@@ -198,7 +198,7 @@ fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
 
 /// Merges an alias redirection hop into the target response.
 ///
-/// Point 15: Preserves the final result's RCODE, answers, authority, and additionals,
+/// Preserves the final result's RCODE, answers, authority, and additionals,
 /// while also merging any DNSSEC-relevant material (NSEC, NSEC3, RRSIG, DNSKEY) from
 /// the first redirection hop so the DNSSEC validator can authenticate the entire chain.
 fn merge_redirection_response(
@@ -481,7 +481,6 @@ impl RecursiveResolver {
                 }
 
                 // 3. Referral processing
-                // Point 16: An empty response lacking an authoritative SOA or NS delegation is invalid
                 if response.name_servers().is_empty() {
                     tracing::warn!(
                         name = %name,
@@ -724,12 +723,13 @@ impl RecursiveResolver {
 
         let txid: u16 = rand::thread_rng().gen();
 
-        // 1. Primary EDNS0 Query
+        // 1. Primary EDNS0 Query with RD=0 and CD=1
         let mut query_msg = Message::new();
         query_msg.set_id(txid);
         query_msg.set_message_type(MessageType::Query);
         query_msg.set_op_code(OpCode::Query);
         query_msg.set_recursion_desired(false);
+        query_msg.set_checking_disabled(true);
 
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
@@ -775,6 +775,7 @@ impl RecursiveResolver {
                 plain_msg.set_message_type(MessageType::Query);
                 plain_msg.set_op_code(OpCode::Query);
                 plain_msg.set_recursion_desired(false);
+                plain_msg.set_checking_disabled(true);
                 plain_msg.add_query(query.clone());
 
                 let plain_bytes = plain_msg.to_bytes()?;
@@ -805,6 +806,7 @@ impl RecursiveResolver {
                     plain_msg.set_message_type(MessageType::Query);
                     plain_msg.set_op_code(OpCode::Query);
                     plain_msg.set_recursion_desired(false);
+                    plain_msg.set_checking_disabled(true);
                     plain_msg.add_query(query.clone());
                     plain_msg.to_bytes()?
                 };
@@ -831,6 +833,7 @@ impl RecursiveResolver {
                         plain_msg.set_message_type(MessageType::Query);
                         plain_msg.set_op_code(OpCode::Query);
                         plain_msg.set_recursion_desired(false);
+                        plain_msg.set_checking_disabled(true);
                         plain_msg.add_query(query.clone());
                         let plain_bytes = plain_msg.to_bytes()?;
 

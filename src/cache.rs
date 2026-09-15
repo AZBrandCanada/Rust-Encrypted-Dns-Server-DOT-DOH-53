@@ -60,6 +60,8 @@ pub struct CacheEntry {
     pub min_ttl: u32,
     pub cached_at: u64,
     pub last_revalidated_at: u64,
+    /// Authoritative DNSSEC validation status. Mandatory field; legacy entries missing
+    /// this field are discarded on startup to prevent insecure downgrades.
     pub dnssec_status: DnssecStatus,
 }
 
@@ -113,6 +115,7 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
                     let mut discarded_legacy = 0;
 
                     for (k, val) in raw_entries {
+                        // Discard legacy entries missing dnssec_status instead of guessing
                         let entry: CacheEntry = match serde_json::from_value(val) {
                             Ok(e) => e,
                             Err(_) => {

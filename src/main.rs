@@ -13,11 +13,11 @@ use cache::{
     create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache,
 };
 use dashmap::DashMap;
-use engine::{remaining_rrsig_validity, AppState};
+use engine::{calculate_cache_ttl, AppState};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
-use recursor::{calculate_min_ttl, RecursiveResolver};
+use recursor::RecursiveResolver;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
 
-    // Point 22: Load persisted cache from disk. Any legacy entries lacking dnssec_status
+    // Load persisted cache from disk. Any legacy entries lacking dnssec_status
     // or exceeding allowable stale windows are automatically discarded.
     load_cache_from_disk(&cache, CACHE_FILE);
 
@@ -271,7 +271,7 @@ async fn bind_tcp(
 /// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
 /// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated.
 ///
-/// Point 21 & 26: Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
+/// Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
 /// validity period per RFC 4035 §5.3.3, matching the exact behavior of runtime resolution.
 async fn preload_domains(
     cache: DnsCache,
@@ -346,15 +346,9 @@ async fn preload_domains(
                             msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
 
                             if let Ok(wire) = msg.to_bytes() {
-                                let mut ttl = calculate_min_ttl(&msg);
                                 let now = now_secs();
-
-                                // Point 21 & 26 / RFC 4035 §5.3.3: Bound TTL to remaining signature validity
-                                if status == dnssec::DnssecStatus::Secure {
-                                    if let Some(rrsig_ttl) = remaining_rrsig_validity(&msg, now) {
-                                        ttl = ttl.min(rrsig_ttl);
-                                    }
-                                }
+                                // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                                let ttl = calculate_cache_ttl(&msg, status, now);
 
                                 cache_ref.insert(
                                     cache_key,
