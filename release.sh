@@ -36,27 +36,14 @@ cargo fmt --all
 echo "OK"
 echo
 
-echo "[3/12] Checking Git working tree..."
-
-if [[ -n "$(git status --porcelain)" ]]; then
-    echo "Changes detected:"
-    git status --short
-    echo
-    echo "These changes will be included in the release commit."
-else
-    echo "No uncommitted changes."
-fi
-
-echo
-
-echo "[4/12] Updating Cargo.lock..."
+echo "[3/12] Updating Cargo.lock..."
 
 cargo check --release
 
 echo "Cargo.lock is synchronized."
 echo
 
-echo "[5/12] Checking release version..."
+echo "[4/12] Checking release version..."
 
 PACKAGE_VERSION="$(
     cargo metadata --format-version 1 --no-deps --locked |
@@ -71,43 +58,50 @@ if [[ "$PACKAGE_VERSION" != "$VERSION" ]]; then
 fi
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
-    echo "ERROR: Git tag ${TAG} already exists."
+    echo "ERROR: Git tag ${TAG} already exists locally."
+    echo "Refusing to overwrite an existing release tag."
+    exit 1
+fi
+
+if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+    echo "ERROR: Git tag ${TAG} already exists on origin."
     echo "Refusing to overwrite an existing release tag."
     exit 1
 fi
 
 echo "Version ${VERSION} OK"
+echo "Tag ${TAG} does not already exist."
 echo
 
-echo "[6/12] Running format verification..."
+echo "[5/12] Running format verification..."
 
 cargo fmt --all -- --check
 
 echo "OK"
 echo
 
-echo "[7/12] Running locked cargo check..."
+echo "[6/12] Running locked cargo check..."
 
 cargo check --release --locked
 
 echo "OK"
 echo
 
-echo "[8/12] Running tests..."
+echo "[7/12] Running tests..."
 
 cargo test --release --locked
 
 echo "OK"
 echo
 
-echo "[9/12] Running clippy..."
+echo "[8/12] Running clippy..."
 
 cargo clippy --release --locked --all-targets -- -D warnings
 
 echo "OK"
 echo
 
-echo "[10/12] Verifying release workflow..."
+echo "[9/12] Verifying release workflow..."
 
 WORKFLOW=".github/workflows/release.yml"
 
@@ -139,7 +133,7 @@ fi
 echo "OK"
 echo
 
-echo "[11/12] Checking release metadata..."
+echo "[10/12] Checking release metadata..."
 
 LICENSE_TYPE="$(
     sed -n 's/^license = "\(.*\)"/\1/p' Cargo.toml |
@@ -164,40 +158,61 @@ fi
 echo "OK"
 echo
 
-echo "[12/12] Final Git status..."
+echo "[11/12] Preparing Git..."
 
-git status --short
+git add -A
+
+if git diff --cached --quiet; then
+    echo "No uncommitted changes."
+    echo "Using the existing HEAD commit for ${TAG}."
+else
+    echo "Changes detected:"
+    git diff --cached --stat
+    echo
+    echo "Creating release commit..."
+    git commit -m "Release ${TAG}"
+fi
 
 echo
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "ERROR: Working tree is still dirty after preparation."
+    git status --short
+    exit 1
+fi
+
+CURRENT_BRANCH="$(git branch --show-current)"
+
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    echo "ERROR: Release must be run from the main branch."
+    echo "Current branch: ${CURRENT_BRANCH}"
+    exit 1
+fi
+
+echo "Git working tree is clean."
+echo "Current commit:"
+git log -1 --oneline
+echo
+
+echo "[12/12] Final release confirmation..."
+
 echo "========================================"
-echo " ALL PREFLIGHT CHECKS PASSED"
+echo " PREFLIGHT CHECKS PASSED"
 echo "========================================"
 echo
-echo "Release: ${TAG}"
+echo "Version: ${VERSION}"
+echo "Tag:     ${TAG}"
+echo "Branch:  ${CURRENT_BRANCH}"
+echo "Commit:  $(git rev-parse --short HEAD)"
 echo
 
-read -r -p "Commit, push main, create ${TAG}, and push the tag? [y/N] " CONFIRM
+read -r -p "Push main, create ${TAG}, and push the tag? [y/N] " CONFIRM
 
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo
     echo "Release cancelled."
     exit 0
 fi
-
-echo
-echo "[RELEASE] Staging changes..."
-
-git add -A
-
-if git diff --cached --quiet; then
-    echo "ERROR: Nothing to commit."
-    exit 1
-fi
-
-echo
-echo "[RELEASE] Committing..."
-
-git commit -m "Release ${TAG}"
 
 echo
 echo "[RELEASE] Pushing main..."
@@ -220,3 +235,6 @@ echo " RELEASE ${TAG} PUSHED SUCCESSFULLY"
 echo "========================================"
 echo
 echo "GitHub Actions will now build and publish the release."
+echo
+echo "Release tag: ${TAG}"
+echo "Commit:      $(git rev-parse --short HEAD)"
