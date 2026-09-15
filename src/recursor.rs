@@ -191,22 +191,18 @@ fn merge_redirection_response(
     q.set_query_class(DNSClass::IN);
     final_response.add_query(q);
 
-    // Prepend redirection records from first hop (CNAME, DNAME, and RRSIGs)
     for r in first_hop_msg.answers() {
         final_response.add_answer(r.clone());
     }
 
-    // Append answers from final target resolution
     for r in final_msg.answers() {
         final_response.add_answer(r.clone());
     }
 
-    // Preserve authority section from final target response (critical for NXDOMAIN/NODATA proofs!)
     for r in final_msg.name_servers() {
         final_response.add_name_server(r.clone());
     }
 
-    // Preserve additionals from final target response
     for r in final_msg.additionals() {
         final_response.add_additional(r.clone());
     }
@@ -283,7 +279,6 @@ impl RecursiveResolver {
                     });
 
                     if let Some(target) = cname_target {
-                        // Fast path: if the server already bundled the target answer, return it
                         let target_in_answers = response
                             .answers()
                             .iter()
@@ -386,7 +381,6 @@ impl RecursiveResolver {
 
                 let delegation_owner = first_ns_rec.name().clone();
 
-                // Group and ensure coherent NS delegation owner across the referral
                 let mut ns_names = Vec::new();
                 for r in response.name_servers() {
                     if r.record_type() == RecordType::NS {
@@ -426,10 +420,6 @@ impl RecursiveResolver {
 
                 let active_delegation = delegation_owner;
 
-                // Extract glue from additionals.
-                // RFC 2181 §5.4.1: Glue is acceptable if it belongs to an advertised nameserver AND:
-                // 1. It is under bailiwick of the answering server (e.g. root or parent TLD), OR
-                // 2. It is under the delegated child zone itself.
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
@@ -468,7 +458,6 @@ impl RecursiveResolver {
                     );
                 }
 
-                // If glue was omitted (or out-of-bailiwick), iteratively resolve nameserver IPs
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
@@ -620,6 +609,7 @@ impl RecursiveResolver {
 
         let txid: u16 = rand::thread_rng().gen();
 
+        // 1. Primary EDNS0 Query
         let mut query_msg = Message::new();
         query_msg.set_id(txid);
         query_msg.set_message_type(MessageType::Query);
@@ -635,7 +625,7 @@ impl RecursiveResolver {
         query.set_name(name.clone());
         query.set_query_type(rtype);
         query.set_query_class(DNSClass::IN);
-        query_msg.add_query(query);
+        query_msg.add_query(query.clone());
 
         let req_bytes = query_msg.to_bytes()?;
 
@@ -649,8 +639,34 @@ impl RecursiveResolver {
             .await
             .map_err(|_| RecursorError::AllNameserversFailed)??;
 
+        // 2. Decode UDP response with RFC 6891 §7 EDNS fallback
         let mut decoder = BinDecoder::new(&buf[..n]);
-        let response = Message::read(&mut decoder)?;
+        let mut used_edns = true;
+        let response = match Message::read(&mut decoder) {
+            Ok(resp) if resp.response_code() != ResponseCode::FormErr => resp,
+            _ => {
+                // EDNS Fallback (RFC 6891 §7): Some broken authoritative servers (e.g. dnsleaktest.com)
+                // return malformed OPT records or FORMERR when queried with EDNS0.
+                // Retry once using plain RFC 1035 DNS (no EDNS).
+                let mut plain_msg = Message::new();
+                plain_msg.set_id(txid);
+                plain_msg.set_message_type(MessageType::Query);
+                plain_msg.set_op_code(OpCode::Query);
+                plain_msg.set_recursion_desired(false);
+                plain_msg.add_query(query.clone());
+
+                let plain_bytes = plain_msg.to_bytes()?;
+                socket.send(&plain_bytes).await?;
+
+                let n = timeout(QUERY_TIMEOUT, socket.recv(&mut buf))
+                    .await
+                    .map_err(|_| RecursorError::AllNameserversFailed)??;
+
+                let mut decoder = BinDecoder::new(&buf[..n]);
+                used_edns = false;
+                Message::read(&mut decoder)?
+            }
+        };
 
         if !response_matches(&response, txid, name, rtype) {
             return Err(RecursorError::AllNameserversFailed);
@@ -659,9 +675,23 @@ impl RecursiveResolver {
         if response.truncated() {
             let tcp_response = timeout(TCP_TIMEOUT, async {
                 let mut stream = TcpStream::connect(addr).await?;
-                let len = (req_bytes.len() as u16).to_be_bytes();
+
+                // If EDNS failed over UDP, use plain query over TCP as well
+                let tcp_query_bytes = if used_edns {
+                    req_bytes
+                } else {
+                    let mut plain_msg = Message::new();
+                    plain_msg.set_id(txid);
+                    plain_msg.set_message_type(MessageType::Query);
+                    plain_msg.set_op_code(OpCode::Query);
+                    plain_msg.set_recursion_desired(false);
+                    plain_msg.add_query(query.clone());
+                    plain_msg.to_bytes()?
+                };
+
+                let len = (tcp_query_bytes.len() as u16).to_be_bytes();
                 stream.write_all(&len).await?;
-                stream.write_all(&req_bytes).await?;
+                stream.write_all(&tcp_query_bytes).await?;
 
                 let mut len_buf = [0u8; 2];
                 stream.read_exact(&mut len_buf).await?;
@@ -674,7 +704,33 @@ impl RecursiveResolver {
                 stream.read_exact(&mut tcp_buf).await?;
 
                 let mut tcp_decoder = BinDecoder::new(&tcp_buf);
-                let tcp_msg = Message::read(&mut tcp_decoder)?;
+                let tcp_msg = match Message::read(&mut tcp_decoder) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let mut plain_msg = Message::new();
+                        plain_msg.set_id(txid);
+                        plain_msg.set_message_type(MessageType::Query);
+                        plain_msg.set_op_code(OpCode::Query);
+                        plain_msg.set_recursion_desired(false);
+                        plain_msg.add_query(query.clone());
+                        let plain_bytes = plain_msg.to_bytes()?;
+
+                        let len = (plain_bytes.len() as u16).to_be_bytes();
+                        stream.write_all(&len).await?;
+                        stream.write_all(&plain_bytes).await?;
+
+                        let mut len_buf = [0u8; 2];
+                        stream.read_exact(&mut len_buf).await?;
+                        let resp_len = u16::from_be_bytes(len_buf) as usize;
+                        if !(12..=65535).contains(&resp_len) {
+                            return Err(RecursorError::Proto(hickory_proto::ProtoError::from("Invalid TCP frame length")));
+                        }
+                        let mut tcp_buf = vec![0u8; resp_len];
+                        stream.read_exact(&mut tcp_buf).await?;
+                        let mut tcp_decoder = BinDecoder::new(&tcp_buf);
+                        Message::read(&mut tcp_decoder)?
+                    }
+                };
                 Ok(tcp_msg)
             })
             .await
