@@ -354,31 +354,36 @@ impl RecursiveResolver {
             let mut bailiwick: Name = Name::root();
 
             for _step in 0..MAX_STEPS {
-                let response =
-                    match Self::query_servers_with_fallback(&current_servers, name, rtype).await {
-                        Some(r) => r,
-                        None => {
-                            // If cached servers failed, refused, or timed out, purge the bad
-                            // delegation entry and self-heal by starting over from the root servers.
-                            if using_cached {
-                                tracing::warn!(
-                                    name = %name,
-                                    "[RECURSOR] Cached delegation servers failed or refused; purging cache and retrying from root"
-                                );
-                                using_cached = false;
-                                self.purge_delegation_for(name, rtype);
-                                current_servers = ROOT_SERVERS
-                                    .iter()
-                                    .filter_map(|ip| ip.parse().ok())
-                                    .map(|ip| SocketAddr::new(ip, 53))
-                                    .collect();
-                                last_zone = None;
-                                bailiwick = Name::root();
-                                continue;
-                            }
-                            return Err(RecursorError::AllNameserversFailed);
+                let response = match Self::query_servers_with_fallback(
+                    &current_servers,
+                    name,
+                    rtype,
+                )
+                .await
+                {
+                    Some(r) => r,
+                    None => {
+                        // If cached servers failed, refused, or timed out, purge the bad
+                        // delegation entry and self-heal by starting over from the root servers.
+                        if using_cached {
+                            tracing::warn!(
+                                name = %name,
+                                "[RECURSOR] Cached delegation servers failed or refused; purging cache and retrying from root"
+                            );
+                            using_cached = false;
+                            self.purge_delegation_for(name, rtype);
+                            current_servers = ROOT_SERVERS
+                                .iter()
+                                .filter_map(|ip| ip.parse().ok())
+                                .map(|ip| SocketAddr::new(ip, 53))
+                                .collect();
+                            last_zone = None;
+                            bailiwick = Name::root();
+                            continue;
                         }
-                    };
+                        return Err(RecursorError::AllNameserversFailed);
+                    }
+                };
 
                 using_cached = false;
 
