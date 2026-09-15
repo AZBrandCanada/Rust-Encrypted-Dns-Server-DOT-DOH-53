@@ -1,9 +1,9 @@
-// src/dnssec.rs
 use crate::cache::now_secs;
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
 use dashmap::DashMap;
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, Nsec3HashAlgorithm, PublicKey};
+use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use ml_dsa::signature::Verifier;
@@ -18,23 +18,18 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-const MAX_SIG_CHECKS: usize = 8;               // KeyTrap (CVE-2023-50387)
-const MAX_NEGATIVE_RECORDS: usize = 8;         // cap NSEC/NSEC3 records processed
-const MAX_NSEC3_ITERATIONS: u16 = 150;         // RFC 9276 recommendation
-const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;  // bounded walk
-const MAX_CNAME_CHAIN: usize = 16;             // bounded CNAME chain walk
+const GLOBAL_MAX_SIG_CHECKS: usize = 24;      // Global budget against KeyTrap (CVE-2023-50387)
+const MAX_NEGATIVE_RECORDS: usize = 8;        // Cap NSEC/NSEC3 records processed
+const MAX_NSEC3_ITERATIONS: u16 = 150;        // RFC 9276 recommendation
+const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16; // Bounded walk
+const MAX_CNAME_CHAIN: usize = 16;            // Bounded CNAME chain walk
 
 /// DNSSEC verdict for a response.
-///
-/// `Insecure` is split into two variants so the cache layer can tell the
-/// difference between "this zone is genuinely unsigned" (safe to cache) and
-/// "we couldn't complete validation" (must not be cached, or a transient
-/// upstream failure becomes a sticky downgrade).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
     /// Cryptographically validated end-to-end.
     Secure,
-    /// Zone positively proven unsigned: the parent returned DS NODATA.
+    /// Zone positively proven unsigned via authenticated denial of DS.
     InsecureUnsigned,
     /// Signedness could not be determined (transient chain-build failure).
     /// Served with AD=0 but MUST NOT be cached.
@@ -44,14 +39,38 @@ pub enum DnssecStatus {
 }
 
 /// Result of asking "is this name inside a signed zone?"
-///
-/// `Unknown` exists so that a transient DS/DNSKEY fetch failure doesn't get
-/// silently conflated with "the zone is unsigned".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoneSignedness {
     Signed,
     ProvenUnsigned,
     Unknown,
+}
+
+/// Global cryptographic verification work budget for a single resolution.
+#[derive(Debug, Clone)]
+pub struct ValidationBudget {
+    sig_checks: usize,
+    max_sig_checks: usize,
+}
+
+impl Default for ValidationBudget {
+    fn default() -> Self {
+        Self {
+            sig_checks: 0,
+            max_sig_checks: GLOBAL_MAX_SIG_CHECKS,
+        }
+    }
+}
+
+impl ValidationBudget {
+    pub fn can_check_sig(&mut self) -> bool {
+        if self.sig_checks >= self.max_sig_checks {
+            false
+        } else {
+            self.sig_checks += 1;
+            true
+        }
+    }
 }
 
 const ROOT_TRUST_ANCHORS: &[(u16, u8, u8, &str)] = &[
@@ -85,6 +104,13 @@ enum ChainResult {
     Bogus,
 }
 
+#[derive(Debug)]
+enum CnameChainResult {
+    Complete(Vec<(Name, Name)>),
+    Loop,
+    TooLong,
+}
+
 pub struct DnssecValidator;
 
 impl DnssecValidator {
@@ -94,29 +120,54 @@ impl DnssecValidator {
         qname: &Name,
         qtype: RecordType,
     ) -> DnssecStatus {
-        if msg.answers().is_empty() {
-            Self::validate_negative(recursor, msg, qname, qtype).await
-        } else {
-            let answers: Vec<Record> = msg.answers().to_vec();
-            Self::validate_answer(recursor, qname, qtype, &answers).await
+        let mut budget = ValidationBudget::default();
+        Self::validate_message_with_budget(recursor, msg, qname, qtype, &mut budget).await
+    }
+
+    pub async fn validate_message_with_budget(
+        recursor: &RecursiveResolver,
+        msg: &hickory_proto::op::Message,
+        qname: &Name,
+        qtype: RecordType,
+        budget: &mut ValidationBudget,
+    ) -> DnssecStatus {
+        match msg.response_code() {
+            ResponseCode::NXDomain => {
+                Self::validate_negative(recursor, msg, qname, qtype, budget).await
+            }
+            ResponseCode::NoError if msg.answers().is_empty() => {
+                Self::validate_negative(recursor, msg, qname, qtype, budget).await
+            }
+            ResponseCode::NoError => {
+                let answers: Vec<Record> = msg.answers().to_vec();
+                Self::validate_answer(recursor, qname, qtype, &answers, budget).await
+            }
+            _ => DnssecStatus::InsecureUnknown,
         }
     }
 
     /// Validate the answer section of a positive response.
-    ///
-    /// RFC 4035 §5.3.1: when following a CNAME/DNAME chain, EVERY RRset in
-    /// the chain must be signed by an authorized zone, and the final RRset of
-    /// the requested type must also be signed.
     pub async fn validate_answer(
         recursor: &RecursiveResolver,
         name: &Name,
         rtype: RecordType,
         all_records: &[Record],
+        budget: &mut ValidationBudget,
     ) -> DnssecStatus {
-        let chain: Vec<(Name, Name)> = if rtype == RecordType::CNAME {
+        let chain = if rtype == RecordType::CNAME {
             Vec::new()
         } else {
-            collect_cname_chain(name, all_records)
+            match collect_cname_chain(name, all_records) {
+                CnameChainResult::Complete(c) => c,
+                CnameChainResult::Loop => {
+                    tracing::warn!(name = %name, "[DNSSEC] CNAME loop detected; Bogus");
+                    return DnssecStatus::Bogus;
+                }
+                CnameChainResult::TooLong => {
+                    tracing::warn!(name = %name, "[DNSSEC] CNAME chain exceeded limit; Bogus");
+                    return DnssecStatus::Bogus;
+                }
+            }
         };
 
         for (owner, _target) in &chain {
@@ -136,6 +187,7 @@ impl DnssecValidator {
                 RecordType::CNAME,
                 &cname_records,
                 all_records,
+                budget,
             )
             .await
             {
@@ -166,16 +218,17 @@ impl DnssecValidator {
             return DnssecStatus::InsecureUnknown;
         }
 
-        Self::validate_rrset(recursor, &final_owner, rtype, &target_records, all_records).await
+        Self::validate_rrset(recursor, &final_owner, rtype, &target_records, all_records, budget).await
     }
 
-    /// Validate a single RRset (all records share owner + rtype).
+    /// Validate a single RRset.
     async fn validate_rrset(
         recursor: &RecursiveResolver,
         owner: &Name,
         rtype: RecordType,
         target_records: &[Record],
         all_records: &[Record],
+        budget: &mut ValidationBudget,
     ) -> DnssecStatus {
         let rrsigs: Vec<RRSIG> = all_records
             .iter()
@@ -190,7 +243,7 @@ impl DnssecValidator {
             .collect();
 
         if rrsigs.is_empty() {
-            return match is_zone_signed(recursor, owner).await {
+            return match is_zone_signed(recursor, owner, budget).await {
                 ZoneSignedness::Signed => {
                     tracing::warn!(
                         owner = %owner,
@@ -211,8 +264,7 @@ impl DnssecValidator {
                     tracing::warn!(
                         owner = %owner,
                         qtype = ?rtype,
-                        "[DNSSEC] No RRSIG and zone signedness unknown; \
-                         Insecure (uncacheable)"
+                        "[DNSSEC] No RRSIG and zone signedness unknown; Insecure (uncacheable)"
                     );
                     DnssecStatus::InsecureUnknown
                 }
@@ -221,45 +273,56 @@ impl DnssecValidator {
 
         let now = now_secs();
 
+        // Filter for time-valid and authorized signatures
+        let mut candidates = Vec::new();
         for rrsig in &rrsigs {
-            let exp = rrsig.sig_expiration().get() as u64;
-            let inc = rrsig.sig_inception().get() as u64;
-            if now > exp || now < inc {
+            if !rrsig_time_valid(rrsig, now) {
                 tracing::debug!(
                     owner = %owner,
-                    expiration = exp,
-                    inception = inc,
+                    sig_exp = rrsig.sig_expiration().get(),
+                    sig_inc = rrsig.sig_inception().get(),
                     now,
-                    "[DNSSEC] RRSIG outside validity window; Bogus"
+                    "[DNSSEC] Skipping RRSIG outside validity window"
                 );
-                return DnssecStatus::Bogus;
+                continue;
             }
-        }
 
-        let mut any_trusted_chain = false;
-
-        for rrsig in &rrsigs {
             let zone = rrsig.signer_name();
-
             if !zone.zone_of(owner) && zone != owner {
                 tracing::warn!(
                     owner = %owner,
                     signer = %zone,
-                    "[DNSSEC] Unauthorized signer for RRset; returning Bogus"
+                    "[DNSSEC] Skipping unauthorized signer for RRset"
                 );
-                return DnssecStatus::Bogus;
+                continue;
             }
 
-            match Self::build_trust_chain(recursor, zone).await {
+            candidates.push(rrsig);
+        }
+
+        if candidates.is_empty() {
+            tracing::warn!(
+                owner = %owner,
+                qtype = ?rtype,
+                rrsig_count = rrsigs.len(),
+                "[DNSSEC] All RRSIGs were expired, not yet valid, or unauthorized; Bogus"
+            );
+            return DnssecStatus::Bogus;
+        }
+
+        let mut any_trusted_chain = false;
+
+        for rrsig in candidates {
+            let zone = rrsig.signer_name();
+
+            match Self::build_trust_chain(recursor, zone, budget).await {
                 ChainResult::Trusted(trusted_keys) => {
                     any_trusted_chain = true;
-                    let mut checks_performed = 0;
                     for dnskey in &trusted_keys {
-                        checks_performed += 1;
-                        if checks_performed > MAX_SIG_CHECKS {
+                        if !budget.can_check_sig() {
                             tracing::warn!(
                                 name = %owner,
-                                "[DNSSEC] Exceeded MAX_SIG_CHECKS (KeyTrap protection); aborting"
+                                "[DNSSEC] Exceeded global signature budget (KeyTrap protection); Bogus"
                             );
                             return DnssecStatus::Bogus;
                         }
@@ -268,16 +331,6 @@ impl DnssecValidator {
                         let tag_match = key_tag == rrsig.key_tag();
                         let sig_ok = tag_match
                             && Self::verify_rrsig(rrsig, dnskey, owner, target_records);
-
-                        tracing::debug!(
-                            owner = %owner,
-                            signer = %zone,
-                            rrsig_tag = rrsig.key_tag(),
-                            dnskey_tag = key_tag,
-                            tag_match,
-                            sig_ok,
-                            "[DNSSEC] RRSIG candidate check"
-                        );
 
                         if sig_ok {
                             return DnssecStatus::Secure;
@@ -297,7 +350,6 @@ impl DnssecValidator {
             }
         }
 
-        // RRSIGs present but none validated.
         if any_trusted_chain {
             tracing::warn!(
                 owner = %owner,
@@ -308,13 +360,9 @@ impl DnssecValidator {
             return DnssecStatus::Bogus;
         }
 
-        // Every signer's chain came back Unsigned, meaning a DS NODATA was
-        // returned at the parent for each. That positively identifies an
-        // unsigned zone, so this is InsecureUnsigned (cacheable).
         tracing::warn!(
             owner = %owner,
             qtype = ?rtype,
-            rrsig_count = rrsigs.len(),
             "[DNSSEC] Validation fell through all RRSIGs with unsigned chains; Insecure"
         );
         DnssecStatus::InsecureUnsigned
@@ -325,6 +373,7 @@ impl DnssecValidator {
         msg: &hickory_proto::op::Message,
         qname: &Name,
         qtype: RecordType,
+        budget: &mut ValidationBudget,
     ) -> DnssecStatus {
         let soa = msg
             .name_servers()
@@ -341,7 +390,17 @@ impl DnssecValidator {
             }
         };
 
-        let keys = match Self::build_trust_chain(recursor, &zone).await {
+        // Zone boundary check
+        if !zone.zone_of(qname) && zone != *qname {
+            tracing::warn!(
+                zone = %zone,
+                qname = %qname,
+                "[DNSSEC] Negative response SOA is not authoritative for qname; Bogus"
+            );
+            return DnssecStatus::Bogus;
+        }
+
+        let keys = match Self::build_trust_chain(recursor, &zone, budget).await {
             ChainResult::Trusted(k) => k,
             ChainResult::Unsigned => {
                 tracing::debug!(
@@ -367,14 +426,14 @@ impl DnssecValidator {
             .iter()
             .any(|r| r.record_type() == RecordType::NSEC3);
         if has_nsec3 {
-            return Self::validate_nsec3(&keys, qname, qtype, &authority);
+            return Self::validate_nsec3(&keys, qname, qtype, &authority, budget);
         }
 
         let has_nsec = authority
             .iter()
             .any(|r| r.record_type() == RecordType::NSEC);
         if has_nsec {
-            return Self::validate_nsec(&keys, qname, qtype, &authority);
+            return Self::validate_nsec(&keys, qname, qtype, &authority, budget);
         }
 
         tracing::warn!(
@@ -385,7 +444,12 @@ impl DnssecValidator {
         DnssecStatus::Bogus
     }
 
-    fn verify_negative_rrset(rec: &Record, authority: &[Record], keys: &[DNSKEY]) -> bool {
+    fn verify_negative_rrset(
+        rec: &Record,
+        authority: &[Record],
+        keys: &[DNSKEY],
+        budget: &mut ValidationBudget,
+    ) -> bool {
         let owner = rec.name().clone();
         let rtype = rec.record_type();
 
@@ -413,10 +477,13 @@ impl DnssecValidator {
         let records = [rec.clone()];
         for sig in &rrsigs {
             for key in keys {
-                if key.key_tag_matches(sig.key_tag())
-                    && Self::verify_rrsig(sig, key, &owner, &records)
-                {
-                    return true;
+                if key.key_tag_matches(sig.key_tag()) {
+                    if !budget.can_check_sig() {
+                        return false;
+                    }
+                    if Self::verify_rrsig(sig, key, &owner, &records) {
+                        return true;
+                    }
                 }
             }
         }
@@ -428,6 +495,7 @@ impl DnssecValidator {
         qname: &Name,
         qtype: RecordType,
         authority: &[Record],
+        budget: &mut ValidationBudget,
     ) -> DnssecStatus {
         let nsec_records: Vec<&Record> = authority
             .iter()
@@ -439,7 +507,7 @@ impl DnssecValidator {
         }
 
         for &nsec in &nsec_records {
-            if !Self::verify_negative_rrset(nsec, authority, keys) {
+            if !Self::verify_negative_rrset(nsec, authority, keys, budget) {
                 tracing::warn!(
                     owner = %nsec.name(),
                     "[DNSSEC] NSEC RRset signature did not verify; Bogus"
@@ -448,6 +516,7 @@ impl DnssecValidator {
             }
         }
 
+        // NODATA check: matching QNAME
         for &rec in &nsec_records {
             if rec.name() == qname {
                 if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
@@ -460,6 +529,7 @@ impl DnssecValidator {
             }
         }
 
+        // NXDOMAIN check: QNAME coverage & closest encloser wildcard coverage
         let qname_covered = nsec_records.iter().any(|&rec| {
             if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
                 nsec_covers(rec.name(), nsec.next_domain_name(), qname)
@@ -492,6 +562,7 @@ impl DnssecValidator {
         qname: &Name,
         qtype: RecordType,
         authority: &[Record],
+        budget: &mut ValidationBudget,
     ) -> DnssecStatus {
         let nsec3_records: Vec<&Record> = authority
             .iter()
@@ -522,8 +593,24 @@ impl DnssecValidator {
             return DnssecStatus::InsecureUnknown;
         }
 
+        // Require consistent parameters across all NSEC3 records
         for &rec in &nsec3_records {
-            if !Self::verify_negative_rrset(rec, authority, keys) {
+            match rec.data() {
+                RData::DNSSEC(DNSSECRData::NSEC3(n)) => {
+                    if n.hash_algorithm() != algorithm
+                        || n.iterations() != iterations
+                        || n.salt() != salt.as_slice()
+                    {
+                        tracing::warn!("[DNSSEC] Inconsistent NSEC3 parameters in proof; Bogus");
+                        return DnssecStatus::Bogus;
+                    }
+                }
+                _ => return DnssecStatus::Bogus,
+            }
+        }
+
+        for &rec in &nsec3_records {
+            if !Self::verify_negative_rrset(rec, authority, keys, budget) {
                 tracing::warn!(
                     owner = %rec.name(),
                     "[DNSSEC] NSEC3 RRset signature did not verify; Bogus"
@@ -534,6 +621,7 @@ impl DnssecValidator {
 
         let hashed_qname = nsec3_hash(qname, &salt, iterations);
 
+        // NODATA proof
         for &rec in &nsec3_records {
             if nsec3_owner_hash(rec).as_deref() == Some(hashed_qname.as_slice()) {
                 if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = rec.data() {
@@ -546,6 +634,7 @@ impl DnssecValidator {
             }
         }
 
+        // Closest encloser proof
         let mut closest: Option<Name> = None;
         let mut cur = qname.clone();
         let mut steps = 0usize;
@@ -585,11 +674,27 @@ impl DnssecValidator {
         }
         let hashed_next = nsec3_hash(&next_closer, &salt, iterations);
 
-        if !nsec3_records
+        let covering_next = nsec3_records
             .iter()
-            .any(|&r| nsec3_covers(r, &hashed_next))
-        {
-            return DnssecStatus::Bogus;
+            .find(|&&r| nsec3_covers(r, &hashed_next));
+
+        let covering_rec = match covering_next {
+            Some(r) => *r,
+            None => return DnssecStatus::Bogus,
+        };
+
+        let is_opt_out = match covering_rec.data() {
+            RData::DNSSEC(DNSSECRData::NSEC3(n)) => (n.flags() & 0x01) != 0,
+            _ => false,
+        };
+
+        if is_opt_out {
+            tracing::debug!(
+                qname = %qname,
+                qtype = ?rtype,
+                "[DNSSEC] Opt-Out NSEC3 covers next-closer; proves insecure delegation"
+            );
+            return DnssecStatus::InsecureUnsigned;
         }
 
         let wildcard = wildcard_name(&closest);
@@ -604,7 +709,11 @@ impl DnssecValidator {
         DnssecStatus::Secure
     }
 
-async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> ChainResult {
+    async fn build_trust_chain(
+        recursor: &RecursiveResolver,
+        target_zone: &Name,
+        budget: &mut ValidationBudget,
+    ) -> ChainResult {
         let mut path = Vec::new();
         let mut cur = target_zone.clone();
         loop {
@@ -622,7 +731,6 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
         for zone in &path {
             let zone_key = zone.to_string().to_lowercase();
 
-            // 1. Check cache first
             if let Some(cached) = cache.get(&zone_key) {
                 if cached.expires_at > now_secs() {
                     trusted_parent_keys = Some(cached.keys.clone());
@@ -630,12 +738,11 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 }
             }
 
-            // 2. Determine trusted DS anchors for this zone
             let trusted_ds: Vec<(u16, u8, u8, Vec<u8>)> = if zone.is_root() {
                 ROOT_TRUST_ANCHORS
                     .iter()
-                    .map(|(tag, alg, digest_type, hex)| {
-                        (*tag, *alg, *digest_type, hex_decode(hex))
+                    .filter_map(|(tag, alg, digest_type, hex)| {
+                        hex_decode(hex).map(|bytes| (*tag, *alg, *digest_type, bytes))
                     })
                     .collect()
             } else {
@@ -650,7 +757,6 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                     }
                 };
 
-                // Query parent for DS record FIRST
                 let ds_msg = match recursor.resolve(zone, RecordType::DS).await {
                     Ok(m) => m,
                     Err(err) => {
@@ -673,13 +779,34 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                     })
                     .collect();
 
-                // ---> CRUCIAL FIX: If no DS at parent, this zone is unsigned! <---
+                // Authenticated denial of DS nonexistence
                 if ds_records.is_empty() {
-                    tracing::debug!(
-                        zone = %zone,
-                        "[DNSSEC] No DS at parent; zone is Insecure (unsigned delegation)"
-                    );
-                    return ChainResult::Unsigned;
+                    let authority = ds_msg.name_servers();
+                    let denial_status = if authority.iter().any(|r| r.record_type() == RecordType::NSEC3) {
+                        Self::validate_nsec3(parent_keys, zone, RecordType::DS, authority, budget)
+                    } else if authority.iter().any(|r| r.record_type() == RecordType::NSEC) {
+                        Self::validate_nsec(parent_keys, zone, RecordType::DS, authority, budget)
+                    } else {
+                        DnssecStatus::Bogus
+                    };
+
+                    match denial_status {
+                        DnssecStatus::Secure | DnssecStatus::InsecureUnsigned => {
+                            tracing::debug!(
+                                zone = %zone,
+                                "[DNSSEC] Authenticated denial of DS verified: zone is Insecure"
+                            );
+                            return ChainResult::Unsigned;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                zone = %zone,
+                                denial_status = ?denial_status,
+                                "[DNSSEC] DS missing but denial proof failed; Bogus (fail-closed)"
+                            );
+                            return ChainResult::Bogus;
+                        }
+                    }
                 }
 
                 let ds_rrsigs: Vec<RRSIG> = ds_msg
@@ -696,10 +823,7 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                     .collect();
 
                 if ds_rrsigs.is_empty() {
-                    tracing::warn!(
-                        zone = %zone,
-                        "[DNSSEC] DS RRset has no RRSIG; Bogus"
-                    );
+                    tracing::warn!(zone = %zone, "[DNSSEC] DS RRset has no RRSIG; Bogus");
                     return ChainResult::Bogus;
                 }
 
@@ -713,19 +837,20 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 let mut ds_verified = false;
                 'ds: for rrsig in &ds_rrsigs {
                     for key in parent_keys {
-                        if key.key_tag_matches(rrsig.key_tag())
-                            && Self::verify_rrsig(rrsig, key, zone, &ds_full_records)
-                        {
-                            ds_verified = true;
-                            break 'ds;
+                        if key.key_tag_matches(rrsig.key_tag()) {
+                            if !budget.can_check_sig() {
+                                tracing::warn!("[DNSSEC] Work budget exhausted verifying DS; Bogus");
+                                return ChainResult::Bogus;
+                            }
+                            if Self::verify_rrsig(rrsig, key, zone, &ds_full_records) {
+                                ds_verified = true;
+                                break 'ds;
+                            }
                         }
                     }
                 }
                 if !ds_verified {
-                    tracing::warn!(
-                        zone = %zone,
-                        "[DNSSEC] Parent DS signature did not verify; Bogus"
-                    );
+                    tracing::warn!(zone = %zone, "[DNSSEC] Parent DS signature did not verify; Bogus");
                     return ChainResult::Bogus;
                 }
 
@@ -734,17 +859,10 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                     .filter_map(|d| {
                         let dt = u8::from(d.digest_type());
                         let alg = u8::from(d.algorithm());
-                        
-                        // Check both digest type AND that the algorithm is one you actually support!
                         let alg_supported = matches!(alg, 8 | 10 | 13 | 14 | 15 | 18);
 
                         if (dt == 2 || dt == 4) && alg_supported {
-                            Some((
-                                d.key_tag(),
-                                alg,
-                                dt,
-                                d.digest().to_vec(),
-                            ))
+                            Some((d.key_tag(), alg, dt, d.digest().to_vec()))
                         } else {
                             None
                         }
@@ -754,7 +872,7 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 if anchors.is_empty() {
                     tracing::warn!(
                         zone = %zone,
-                        "[DNSSEC] DS RRset has no SHA-256 or SHA-384 digests; Unsigned"
+                        "[DNSSEC] DS RRset has no supported SHA-256 or SHA-384 digests; Unsigned"
                     );
                     return ChainResult::Unsigned;
                 }
@@ -762,7 +880,6 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 anchors
             };
 
-            // 3. NOW fetch DNSKEY (we know the zone is signed because a valid DS exists)
             let dnskey_msg = match recursor.resolve(zone, RecordType::DNSKEY).await {
                 Ok(m) => m,
                 Err(err) => {
@@ -786,10 +903,7 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 .collect();
 
             if candidates.is_empty() {
-                tracing::warn!(
-                    zone = %zone,
-                    "[DNSSEC] DNSKEY query returned no keys for a signed zone; Bogus (fail-closed)"
-                );
+                tracing::warn!(zone = %zone, "[DNSSEC] DNSKEY query returned no keys; Bogus");
                 return ChainResult::Bogus;
             }
 
@@ -807,20 +921,12 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
                 .collect();
 
             if dnskey_rrsigs.is_empty() {
-                tracing::warn!(
-                    zone = %zone,
-                    "[DNSSEC] DNSKEY RRset has no RRSIG; Bogus (fail-closed)"
-                );
+                tracing::warn!(zone = %zone, "[DNSSEC] DNSKEY RRset has no RRSIG; Bogus");
                 return ChainResult::Bogus;
             }
 
             let mut matched_keys: Vec<DNSKEY> = Vec::new();
-            let mut checks = 0;
             for cand in &candidates {
-                checks += 1;
-                if checks > MAX_SIG_CHECKS {
-                    break;
-                }
                 let cand_tag = compute_key_tag(cand).unwrap_or(u16::MAX);
                 let cand_alg = u8::from(cand.public_key().algorithm());
                 for (tag, alg, digest_type, digest) in &trusted_ds {
@@ -852,11 +958,15 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
             let mut dnskey_verified = false;
             'dk: for rrsig in &dnskey_rrsigs {
                 for key in &matched_keys {
-                    if key.key_tag_matches(rrsig.key_tag())
-                        && Self::verify_rrsig(rrsig, key, zone, &dnskey_full_records)
-                    {
-                        dnskey_verified = true;
-                        break 'dk;
+                    if key.key_tag_matches(rrsig.key_tag()) {
+                        if !budget.can_check_sig() {
+                            tracing::warn!("[DNSSEC] Work budget exhausted verifying DNSKEY; Bogus");
+                            return ChainResult::Bogus;
+                        }
+                        if Self::verify_rrsig(rrsig, key, zone, &dnskey_full_records) {
+                            dnskey_verified = true;
+                            break 'dk;
+                        }
                     }
                 }
             }
@@ -888,19 +998,37 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
     }
 
     fn verify_rrsig(rrsig: &RRSIG, dnskey: &DNSKEY, owner: &Name, records: &[Record]) -> bool {
+        let now = now_secs();
+        if !rrsig_time_valid(rrsig, now) {
+            tracing::debug!(
+                owner = %owner,
+                sig_exp = rrsig.sig_expiration().get(),
+                sig_inc = rrsig.sig_inception().get(),
+                now,
+                "[DNSSEC] RRSIG validity period violated"
+            );
+            return false;
+        }
+
+        if rrsig.algorithm() != dnskey.public_key().algorithm() {
+            tracing::debug!(
+                rrsig_alg = ?rrsig.algorithm(),
+                dnskey_alg = ?dnskey.public_key().algorithm(),
+                "[DNSSEC] Algorithm mismatch between RRSIG and DNSKEY"
+            );
+            return false;
+        }
+
         let tbs = match build_tbs(rrsig, owner, records) {
             Some(t) => t,
             None => {
-                tracing::debug!(
-                    owner = %owner,
-                    "[DNSSEC] Failed to build TBS for RRSIG"
-                );
+                tracing::debug!(owner = %owner, "[DNSSEC] Failed to build TBS for RRSIG");
                 return false;
             }
         };
 
         if verify_signature(
-            dnskey.public_key().algorithm(),
+            rrsig.algorithm(),
             dnskey.public_key().public_bytes(),
             &tbs,
             rrsig.sig(),
@@ -913,21 +1041,26 @@ async fn build_trust_chain(recursor: &RecursiveResolver, target_zone: &Name) -> 
 }
 
 // -------------------------------------------------------------------------
-// CNAME chain helpers
+// Helper functions
 // -------------------------------------------------------------------------
 
-fn collect_cname_chain(name: &Name, records: &[Record]) -> Vec<(Name, Name)> {
+fn rrsig_time_valid(sig: &RRSIG, now: u64) -> bool {
+    let exp = sig.sig_expiration().get() as u64;
+    let inc = sig.sig_inception().get() as u64;
+    now >= inc && now <= exp
+}
+
+fn collect_cname_chain(name: &Name, records: &[Record]) -> CnameChainResult {
     let mut chain = Vec::new();
     let mut current = name.clone();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<Name> = HashSet::new();
 
     loop {
-        let key = current.to_string().to_lowercase();
-        if !seen.insert(key) {
-            break;
+        if !seen.insert(current.clone()) {
+            return CnameChainResult::Loop;
         }
         if chain.len() >= MAX_CNAME_CHAIN {
-            break;
+            return CnameChainResult::TooLong;
         }
 
         let target = records.iter().find_map(|r| {
@@ -948,28 +1081,14 @@ fn collect_cname_chain(name: &Name, records: &[Record]) -> Vec<(Name, Name)> {
         }
     }
 
-    chain
+    CnameChainResult::Complete(chain)
 }
 
-// -------------------------------------------------------------------------
-// Signed-zone detection for missing RRSIGs
-// -------------------------------------------------------------------------
-
-/// Ask the recursor whether `name` lies inside a signed zone.
-///
-/// Fast path: the SOA query response will include the SOA's RRSIG if the
-/// containing zone is signed. When we see that, we return `Signed` without
-/// even doing a DS lookup.
-///
-/// Slow path: no RRSIG on the SOA. Then query DS at the apex. A positive DS
-/// means the zone is signed; a clean NODATA means it is genuinely unsigned.
-/// A failure to complete either query returns `Unknown`, which propagates to
-/// `DnssecStatus::InsecureUnknown` and prevents caching.
-///
-/// The result is cached per zone for 5 minutes, but `Unknown` results are
-/// never cached so a transient failure doesn't stick.
-async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSignedness {
-    // 1. Cheap fast-path via the signed-zone cache.
+async fn is_zone_signed(
+    recursor: &RecursiveResolver,
+    name: &Name,
+    budget: &mut ValidationBudget,
+) -> ZoneSignedness {
     let cache = signed_zone_cache();
     let mut cur = name.clone();
     loop {
@@ -977,10 +1096,7 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         if let Some(entry) = cache.get(&key) {
             if entry.expires_at > now_secs() {
                 match entry.signedness {
-                    // ProvenUnsigned CAN be inherited down to subdomains
                     ZoneSignedness::ProvenUnsigned => return ZoneSignedness::ProvenUnsigned,
-
-                    // Signed CANNOT be inherited from root ('.') or TLDs ('.com')!
                     ZoneSignedness::Signed => {
                         if cur.is_root() || cur.num_labels() <= 2 {
                             if cur == *name {
@@ -990,7 +1106,6 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
                             return ZoneSignedness::Signed;
                         }
                     }
-
                     ZoneSignedness::Unknown => {}
                 }
             }
@@ -1001,12 +1116,8 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         cur = cur.base_name();
     }
 
-    // 2. Walk up from `name` to find the real zone apex SOA.
-    // For CNAMEs and subdomains (like sync.opera.com), querying SOA on the leaf
-    // returns a CNAME or empty answers. Trimming to the base domain (e.g. opera.com)
-    // correctly discovers the true zone apex.
+    // Walk up to find the true zone apex
     let mut apex_candidate = name.clone();
-    let mut soa_msg = None;
     let mut zone = None;
 
     while apex_candidate.num_labels() > 2 {
@@ -1023,7 +1134,6 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
                     }
                 });
             if let Some(z) = found {
-                soa_msg = Some(m);
                 zone = Some(z);
                 break;
             }
@@ -1031,10 +1141,9 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
         apex_candidate = apex_candidate.base_name();
     }
 
-    // Fallback if no apex was found during the walk
-    let (soa_msg, zone) = match (soa_msg, zone) {
-        (Some(m), Some(z)) => (m, z),
-        _ => {
+    let zone = match zone {
+        Some(z) => z,
+        None => {
             let m = match recursor.resolve(&apex_candidate, RecordType::SOA).await {
                 Ok(m) => m,
                 Err(_) => return ZoneSignedness::Unknown,
@@ -1051,67 +1160,17 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
                     }
                 });
             match z {
-                Some(zone_name) => (m, zone_name),
+                Some(zone_name) => zone_name,
                 None => return ZoneSignedness::Unknown,
             }
         }
     };
 
-    let soa_has_rrsig = soa_msg
-        .answers()
-        .iter()
-        .chain(soa_msg.name_servers().iter())
-        .any(|r| {
-            matches!(
-                r.data(),
-                RData::DNSSEC(DNSSECRData::RRSIG(sig))
-                    if sig.type_covered() == RecordType::SOA
-            )
-        });
-
-    if soa_has_rrsig {
-        cache.insert(
-            zone.to_string().to_lowercase(),
-            SignedZoneEntry {
-                signedness: ZoneSignedness::Signed,
-                expires_at: now_secs() + 300,
-            },
-        );
-        tracing::debug!(
-            zone = %zone,
-            queried_name = %name,
-            "[DNSSEC] is_zone_signed: SOA carries RRSIG -> Signed"
-        );
-        return ZoneSignedness::Signed;
-    }
-
-    if zone.is_root() {
-        cache.insert(
-            zone.to_string().to_lowercase(),
-            SignedZoneEntry {
-                signedness: ZoneSignedness::Signed,
-                expires_at: now_secs() + 300,
-            },
-        );
-        return ZoneSignedness::Signed;
-    }
-
-    // 3. Slow path: DS lookup at the apex
-    let ds_msg = match recursor.resolve(&zone, RecordType::DS).await {
-        Ok(m) => m,
-        Err(_) => return ZoneSignedness::Unknown,
-    };
-
-    let ds_present = ds_msg.answers().iter().any(|r| {
-        r.record_type() == RecordType::DS && r.name() == &zone
-    });
-
-    let signedness = if ds_present {
-        ZoneSignedness::Signed
-    } else if ds_msg.response_code() == hickory_proto::op::ResponseCode::NoError {
-        ZoneSignedness::ProvenUnsigned
-    } else {
-        ZoneSignedness::Unknown
+    // Authenticate signedness using trust chain validation
+    let signedness = match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
+        ChainResult::Trusted(_) => ZoneSignedness::Signed,
+        ChainResult::Unsigned => ZoneSignedness::ProvenUnsigned,
+        ChainResult::Bogus => ZoneSignedness::Unknown,
     };
 
     if signedness != ZoneSignedness::Unknown {
@@ -1133,10 +1192,6 @@ async fn is_zone_signed(recursor: &RecursiveResolver, name: &Name) -> ZoneSigned
 
     signedness
 }
-
-// -------------------------------------------------------------------------
-// NSEC helpers
-// -------------------------------------------------------------------------
 
 fn wildcard_name(closest: &Name) -> Name {
     let base = closest.to_ascii();
@@ -1170,14 +1225,14 @@ fn nsec_covers(owner: &Name, next: &Name, target: &Name) -> bool {
     }
 }
 
-// -------------------------------------------------------------------------
-// NSEC3 helpers
-// -------------------------------------------------------------------------
-
 fn nsec3_owner_hash(rec: &Record) -> Option<Vec<u8>> {
     let s = rec.name().to_string();
     let first_label = s.trim_end_matches('.').split('.').next()?;
-    base32hex_decode(first_label)
+    let hash = base32hex_decode(first_label)?;
+    if hash.len() != 20 {
+        return None;
+    }
+    Some(hash)
 }
 
 fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
@@ -1239,10 +1294,6 @@ fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// -------------------------------------------------------------------------
-// Key tag, DS digest, TBS, signature verification
-// -------------------------------------------------------------------------
-
 trait KeyTagExt {
     fn key_tag_matches(&self, tag: u16) -> bool;
 }
@@ -1279,8 +1330,8 @@ fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<V
     {
         let mut encoder = BinEncoder::new(&mut buf);
         encoder.set_canonical_names(true);
-        let _ = owner.emit(&mut encoder);
-        let _ = dnskey.emit(&mut encoder);
+        owner.emit(&mut encoder).ok()?;
+        dnskey.emit(&mut encoder).ok()?;
     }
     match digest_type {
         2 => Some(Sha256::digest(&buf).to_vec()),
@@ -1289,20 +1340,36 @@ fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<V
     }
 }
 
-fn hex_decode(s: &str) -> Vec<u8> {
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
     (0..s.len())
         .step_by(2)
-        .filter_map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .map(|i| {
+            s.get(i..i + 2)
+                .and_then(|b| u8::from_str_radix(b, 16).ok())
+        })
         .collect()
 }
 
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+    if records.is_empty() {
+        return None;
+    }
 
+    let expected_type = rrsig.type_covered();
+    let expected_class = records[0].dns_class();
+    for rec in records {
+        if rec.record_type() != expected_type
+            || rec.dns_class() != expected_class
+            || rec.name() != owner
+        {
+            return None;
+        }
+    }
+
+    let mut out = Vec::new();
     out.extend_from_slice(&(u16::from(rrsig.type_covered()).to_be_bytes()));
     out.push(u8::from(rrsig.algorithm()));
     out.push(rrsig.num_labels());
@@ -1456,7 +1523,8 @@ fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     let (exponent, modulus) = rest.split_at(exp_len);
-    if modulus.is_empty() {
+    // Enforce 2048-8192 bit length bounds
+    if modulus.is_empty() || modulus.len() < 256 || modulus.len() > 1024 {
         return None;
     }
     Some((exponent, modulus))

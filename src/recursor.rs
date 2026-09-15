@@ -1,4 +1,3 @@
-// src/recursor.rs
 use dashmap::DashMap;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
@@ -71,16 +70,6 @@ pub struct RecursiveResolver {
     delegation_cache: DashMap<String, DelegationEntry>,
 }
 
-/// SECURITY: rejects IP addresses that must never be treated as a candidate
-/// upstream nameserver, whether they arrive as delegation glue (additionals)
-/// or as the result of resolving an NS hostname's own A/AAAA record.
-///
-/// Without this check, anyone who controls the NS delegation for a domain
-/// (i.e. anyone who owns a domain) can hand this resolver glue records that
-/// point at 127.0.0.1, a cloud metadata endpoint (169.254.169.254), or an
-/// internal RFC1918 address, and the resolver will happily open a socket and
-/// send it a DNS query. That's a confused-deputy / reflection primitive: the
-/// attacker picks the target, this server does the sending.
 fn is_safe_upstream_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -99,11 +88,11 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
             if o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000 {
                 return false;
             }
-            // 198.18.0.0/15 - benchmarking (RFC 2544)
+            // 198.18.0.0/15 - Benchmarking (RFC 2544)
             if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
                 return false;
             }
-            // 0.0.0.0/8 - "this network"
+            // 0.0.0.0/8 - "This network"
             if o[0] == 0 {
                 return false;
             }
@@ -114,11 +103,11 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
                 return false;
             }
             let seg0 = v6.segments()[0];
-            // fc00::/7 - unique local addresses
+            // fc00::/7 - Unique Local Addresses
             if (seg0 & 0xfe00) == 0xfc00 {
                 return false;
             }
-            // fe80::/10 - link-local
+            // fe80::/10 - Link-local
             if (seg0 & 0xffc0) == 0xfe80 {
                 return false;
             }
@@ -139,8 +128,7 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
 }
 
 fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
-    let filtered: Vec<IpAddr> = ips.into_iter().filter(|ip| is_safe_upstream_ip(*ip)).collect();
-    filtered
+    ips.into_iter().filter(|ip| is_safe_upstream_ip(*ip)).collect()
 }
 
 impl RecursiveResolver {
@@ -183,15 +171,20 @@ impl RecursiveResolver {
                     None => return Err(RecursorError::AllNameserversFailed),
                 };
 
-                // 1. Positive answer or CNAME
+                // 1. Positive answer or CNAME for the exact queried name
                 if !response.answers().is_empty() {
                     let has_target_type = response
                         .answers()
                         .iter()
-                        .any(|r| r.record_type() == rtype);
+                        .any(|r| r.name() == name && r.record_type() == rtype);
+
                     let cname_target = response.answers().iter().find_map(|r| {
-                        if let RData::CNAME(cname) = r.data() {
-                            Some(cname.0.clone())
+                        if r.name() == name && r.record_type() == RecordType::CNAME {
+                            if let RData::CNAME(cname) = r.data() {
+                                Some(cname.0.clone())
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -216,16 +209,25 @@ impl RecursiveResolver {
                             return Ok(merged);
                         }
                         return Ok(response);
+                    }
+                }
+
+                // 2. Authoritative terminal responses
+                let authoritative_soa = response.name_servers().iter().find_map(|r| {
+                    if matches!(r.data(), RData::SOA(_)) {
+                        Some(r.name())
                     } else {
+                        None
+                    }
+                });
+
+                if let Some(soa_zone) = authoritative_soa {
+                    if soa_zone.zone_of(name) || soa_zone == name {
                         return Ok(response);
                     }
                 }
 
-                // 2. Final negative or authoritative response (NXDomain, Authoritative AA=1, or SOA present)
-                if response.response_code() == ResponseCode::NXDomain
-                    || response.authoritative()
-                    || response.name_servers().iter().any(|r| matches!(r.data(), RData::SOA(_)))
-                {
+                if response.response_code() == ResponseCode::NXDomain && response.authoritative() {
                     return Ok(response);
                 }
 
@@ -234,56 +236,58 @@ impl RecursiveResolver {
                     return Ok(response);
                 }
 
-                let ns_names: Vec<Name> = response
+                let first_ns = response
                     .name_servers()
                     .iter()
-                    .filter_map(|r| {
-                        if let RData::NS(ns) = r.data() {
-                            Some(ns.0.clone())
-                        } else {
-                            None
+                    .find(|r| r.record_type() == RecordType::NS);
+
+                let Some(first_ns_rec) = first_ns else {
+                    return Ok(response);
+                };
+
+                let delegation_owner = first_ns_rec.name().clone();
+
+                // Group and ensure coherent NS delegation owner
+                let mut ns_names = Vec::new();
+                for r in response.name_servers() {
+                    if r.record_type() == RecordType::NS {
+                        if r.name() != &delegation_owner {
+                            tracing::warn!(
+                                expected = %delegation_owner,
+                                actual = %r.name(),
+                                "[SECURITY] Inconsistent NS owners in referral; aborting"
+                            );
+                            return Err(RecursorError::NoProgress);
                         }
-                    })
-                    .collect();
+                        if let RData::NS(ns) = r.data() {
+                            ns_names.push(ns.0.clone());
+                        }
+                    }
+                }
 
                 if ns_names.is_empty() {
                     return Ok(response);
                 }
 
-                let zone_name = response
-                    .name_servers()
-                    .first()
-                    .map(|r| r.name().clone());
-
-                if let Some(ref z) = zone_name {
-                    if last_zone.as_ref() == Some(z) {
-                        return Err(RecursorError::NoProgress);
-                    }
+                if last_zone.as_ref() == Some(&delegation_owner) {
+                    return Err(RecursorError::NoProgress);
                 }
 
                 // Verify bailiwick boundaries
-                let mut valid_delegation_zone: Option<Name> = None;
-                if let Some(ref z) = zone_name {
-                    let is_child_of_target = z.zone_of(name);
-                    let is_within_bailiwick = bailiwick.is_root() || bailiwick.zone_of(z) || bailiwick == *z;
-                    if is_child_of_target && is_within_bailiwick {
-                        valid_delegation_zone = Some(z.clone());
-                    } else {
-                        tracing::warn!(
-                            delegation = %z,
-                            target = %name,
-                            bailiwick = %bailiwick,
-                            "[SECURITY] Out-of-bailiwick delegation rejected"
-                        );
-                    }
+                let is_child_of_target = delegation_owner.zone_of(name) || &delegation_owner == name;
+                let is_within_bailiwick = bailiwick.is_root() || bailiwick.zone_of(&delegation_owner) || bailiwick == delegation_owner;
+                if !is_child_of_target || !is_within_bailiwick {
+                    tracing::warn!(
+                        delegation = %delegation_owner,
+                        target = %name,
+                        bailiwick = %bailiwick,
+                        "[SECURITY] Out-of-bailiwick delegation rejected"
+                    );
+                    return Err(RecursorError::NoProgress);
                 }
 
-                let active_delegation = match valid_delegation_zone {
-                    Some(z) => z,
-                    None => return Err(RecursorError::NoProgress),
-                };
+                let active_delegation = delegation_owner;
 
-                // Prioritize IPv4 glue for upstream authoritative server communication
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
@@ -291,48 +295,53 @@ impl RecursiveResolver {
                     }
                     match add.data() {
                         RData::A(a) => next_ips.push(IpAddr::V4(a.0)),
-                        RData::AAAA(a) => {
-                            if next_ips.is_empty() {
-                                next_ips.push(IpAddr::V6(a.0));
-                            }
-                        }
+                        RData::AAAA(a) => next_ips.push(IpAddr::V6(a.0)),
                         _ => {}
                     }
                 }
 
-                // SECURITY: strip any glue that points at loopback/private/link-local/
-                // metadata-service ranges before we ever consider it. See
-                // is_safe_upstream_ip() for the full rationale.
                 let dropped_glue = next_ips.len();
                 next_ips = filter_safe_ips(next_ips);
                 if next_ips.len() != dropped_glue {
                     tracing::warn!(
                         zone = %active_delegation,
                         dropped = dropped_glue - next_ips.len(),
-                        "[SECURITY] Dropped unsafe glue IP(s) in delegation (possible SSRF/reflection attempt)"
+                        "[SECURITY] Dropped unsafe glue IP(s) in delegation"
                     );
                 }
 
-                // If glue was omitted, iteratively resolve nameserver IPs
+                // If glue was omitted, iteratively resolve A and AAAA
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
-                        let key_a = format!("ns:a:{}", ns_name.to_string().to_lowercase());
-                        if !visited.contains(&key_a) {
-                            visited.insert(key_a);
+                        let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
+                        if !visited.contains(&key_ns) {
+                            visited.insert(key_ns);
+
                             if let Ok(ns_resp) = self
                                 .resolve_internal(ns_name, RecordType::A, depth + 1, visited)
                                 .await
                             {
                                 for ans in ns_resp.answers() {
-                                    if let RData::A(a) = ans.data() {
-                                        if is_safe_upstream_ip(IpAddr::V4(a.0)) {
-                                            next_ips.push(IpAddr::V4(a.0));
-                                        } else {
-                                            tracing::warn!(
-                                                ns = %ns_name,
-                                                ip = %a.0,
-                                                "[SECURITY] Dropped unsafe resolved NS IP (possible SSRF/reflection attempt)"
-                                            );
+                                    if ans.name() == ns_name {
+                                        if let RData::A(a) = ans.data() {
+                                            if is_safe_upstream_ip(IpAddr::V4(a.0)) {
+                                                next_ips.push(IpAddr::V4(a.0));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Ok(ns_resp) = self
+                                .resolve_internal(ns_name, RecordType::AAAA, depth + 1, visited)
+                                .await
+                            {
+                                for ans in ns_resp.answers() {
+                                    if ans.name() == ns_name {
+                                        if let RData::AAAA(aaaa) = ans.data() {
+                                            if is_safe_upstream_ip(IpAddr::V6(aaaa.0)) {
+                                                next_ips.push(IpAddr::V6(aaaa.0));
+                                            }
                                         }
                                     }
                                 }
@@ -370,12 +379,6 @@ impl RecursiveResolver {
 
     fn find_cached_start(&self, name: &Name, rtype: RecordType) -> Option<Vec<IpAddr>> {
         let now = now_secs();
-        // A DS RRset is authoritative at the *parent* of the child zone, so
-        // for DS queries the delegation cache must be searched starting at
-        // the parent name, not at the name itself.  Without this, asking for
-        // `DS com.` would return the `com.` servers instead of the root, and
-        // the `com.` servers would (correctly) respond NODATA -- making every
-        // signed TLD look unsigned.
         let mut current = if rtype == RecordType::DS {
             name.base_name()
         } else {
@@ -395,6 +398,7 @@ impl RecursiveResolver {
         }
         None
     }
+
     async fn query_servers_with_fallback(
         servers: &[SocketAddr],
         name: &Name,
@@ -449,8 +453,6 @@ impl RecursiveResolver {
         name: &Name,
         rtype: RecordType,
     ) -> Result<Message, RecursorError> {
-        // Defense in depth: even though callers should only ever hand us
-        // pre-filtered addresses, refuse to dial an unsafe IP here too.
         if !is_safe_upstream_ip(addr.ip()) {
             tracing::warn!(ip = %addr.ip(), "[SECURITY] Refused to query unsafe upstream IP");
             return Err(RecursorError::AllNameserversFailed);
@@ -494,23 +496,31 @@ impl RecursiveResolver {
             return Err(RecursorError::AllNameserversFailed);
         }
 
+        // Handle truncation over TCP with whole-transaction timeout protection
         if response.truncated() {
-            let mut stream = timeout(TCP_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .map_err(|_| RecursorError::AllNameserversFailed)??;
-            let len = (req_bytes.len() as u16).to_be_bytes();
-            stream.write_all(&len).await?;
-            stream.write_all(&req_bytes).await?;
+            let tcp_response = timeout(TCP_TIMEOUT, async {
+                let mut stream = TcpStream::connect(addr).await?;
+                let len = (req_bytes.len() as u16).to_be_bytes();
+                stream.write_all(&len).await?;
+                stream.write_all(&req_bytes).await?;
 
-            let mut len_buf = [0u8; 2];
-            stream.read_exact(&mut len_buf).await?;
-            let resp_len = u16::from_be_bytes(len_buf) as usize;
+                let mut len_buf = [0u8; 2];
+                stream.read_exact(&mut len_buf).await?;
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if !(12..=65535).contains(&resp_len) {
+                    return Err(RecursorError::Proto(hickory_proto::ProtoError::from("Invalid TCP frame length")));
+                }
 
-            let mut tcp_buf = vec![0u8; resp_len];
-            stream.read_exact(&mut tcp_buf).await?;
+                let mut tcp_buf = vec![0u8; resp_len];
+                stream.read_exact(&mut tcp_buf).await?;
 
-            let mut tcp_decoder = BinDecoder::new(&tcp_buf);
-            let tcp_response = Message::read(&mut tcp_decoder)?;
+                let mut tcp_decoder = BinDecoder::new(&tcp_buf);
+                let tcp_msg = Message::read(&mut tcp_decoder)?;
+                Ok(tcp_msg)
+            })
+            .await
+            .map_err(|_| RecursorError::AllNameserversFailed)?
+            .map_err(|_: RecursorError| RecursorError::AllNameserversFailed)?;
 
             if !response_matches(&tcp_response, txid, name, rtype) {
                 return Err(RecursorError::AllNameserversFailed);
@@ -531,7 +541,13 @@ fn response_matches(
     if response.id() != txid || response.message_type() != MessageType::Response {
         return false;
     }
-    let Some(q) = response.queries().first() else { return false };
+    if response.op_code() != OpCode::Query {
+        return false;
+    }
+    if response.queries().len() != 1 {
+        return false;
+    }
+    let q = &response.queries()[0];
     if q.query_type() != rtype || q.query_class() != DNSClass::IN {
         return false;
     }
@@ -550,10 +566,10 @@ pub fn calculate_min_ttl(msg: &Message) -> u32 {
     for r in msg.additionals() {
         min_ttl = min_ttl.min(r.ttl());
     }
-    if min_ttl == u32::MAX || min_ttl == 0 {
+    if min_ttl == u32::MAX {
         300
     } else {
-        min_ttl.clamp(30, 86400)
+        min_ttl.min(86400)
     }
 }
 
@@ -565,6 +581,9 @@ fn delegation_ttl(msg: &Message) -> u64 {
     for r in msg.additionals() {
         min_ttl = min_ttl.min(r.ttl());
     }
-    let ttl = if min_ttl == u32::MAX { MIN_DELEGATION_TTL as u32 } else { min_ttl };
-    (ttl as u64).clamp(MIN_DELEGATION_TTL, MAX_DELEGATION_TTL)
+    if min_ttl == u32::MAX {
+        MIN_DELEGATION_TTL
+    } else {
+        (min_ttl as u64).min(MAX_DELEGATION_TTL)
+    }
 }
