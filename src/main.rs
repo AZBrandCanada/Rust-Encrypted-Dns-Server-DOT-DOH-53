@@ -101,7 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if dnssec_enforce {
         tracing::info!("[DNSSEC] Enforcement ON: Broken/Bogus DNSSEC chains will return SERVFAIL");
     } else {
-        tracing::warn!("[DNSSEC] Enforcement OFF: Broken/Bogus DNSSEC chains will return records with AD=0");
+        tracing::warn!(
+            "[DNSSEC] Enforcement OFF: Broken/Bogus DNSSEC chains will return records with AD=0"
+        );
     }
 
     {
@@ -241,7 +243,11 @@ async fn bind_udp(
     match UdpSocket::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(preferred, fallback, "[UDP] Permission denied for port, using fallback");
+            tracing::warn!(
+                preferred,
+                fallback,
+                "[UDP] Permission denied for port, using fallback"
+            );
             let s = UdpSocket::bind(format!("{}:{}", host, fallback)).await?;
             Ok((s, fallback))
         }
@@ -258,7 +264,11 @@ async fn bind_tcp(
     match TcpListener::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(preferred, fallback, "[TCP] Permission denied for port, using fallback");
+            tracing::warn!(
+                preferred,
+                fallback,
+                "[TCP] Permission denied for port, using fallback"
+            );
             let s = TcpListener::bind(format!("{}:{}", host, fallback)).await?;
             Ok((s, fallback))
         }

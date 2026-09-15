@@ -11,14 +11,18 @@ pub struct LoadedCert {
     pub key_file: String,
 }
 
-pub fn load_or_generate(cert_path: &str, key_path: &str) -> Result<LoadedCert, Box<dyn std::error::Error>> {
+pub fn load_or_generate(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<LoadedCert, Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     if Path::new(cert_path).exists() && Path::new(key_path).exists() {
         let cert_bytes = std::fs::read(cert_path)?;
         let key_bytes = std::fs::read(key_path)?;
 
-        let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<Vec<_>, _>>()?;
+        let certs =
+            rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<Vec<_>, _>>()?;
         let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
             .ok_or("No private key found in key file")?;
 
@@ -62,8 +66,7 @@ pub fn load_or_generate(cert_path: &str, key_path: &str) -> Result<LoadedCert, B
         let _ = std::fs::write("selfsigned_key.pem", &key_pem);
     }
 
-    let certs =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
     let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
         .ok_or("Failed to parse generated self-signed key")?;
 
@@ -76,7 +79,9 @@ pub fn load_or_generate(cert_path: &str, key_path: &str) -> Result<LoadedCert, B
     })
 }
 
-pub fn dot_server_config(loaded: &LoadedCert) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
+pub fn dot_server_config(
+    loaded: &LoadedCert,
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(loaded.certs.clone(), loaded.key.clone_key())

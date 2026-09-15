@@ -1,7 +1,6 @@
 use crate::cache::now_secs;
 use crate::recursor::{
-    calculate_min_ttl, dname_substitute, extract_dname_target, DNAME_RECORD_TYPE,
-    RecursiveResolver,
+    calculate_min_ttl, dname_substitute, extract_dname_target, RecursiveResolver, DNAME_RECORD_TYPE,
 };
 use dashmap::DashMap;
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
@@ -70,8 +69,18 @@ impl ValidationBudget {
 }
 
 const ROOT_TRUST_ANCHORS: &[(u16, u8, u8, &str)] = &[
-    (20326, 8, 2, "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
-    (38696, 8, 2, "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"),
+    (
+        20326,
+        8,
+        2,
+        "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+    ),
+    (
+        38696,
+        8,
+        2,
+        "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
+    ),
 ];
 
 struct CachedZoneKeys {
@@ -270,7 +279,9 @@ impl DnssecValidator {
 
         let final_owner = match chain.last() {
             Some(RedirectionStep::Cname { target, .. }) => target.clone(),
-            Some(RedirectionStep::Dname { redirected_name, .. }) => redirected_name.clone(),
+            Some(RedirectionStep::Dname {
+                redirected_name, ..
+            }) => redirected_name.clone(),
             None => name.clone(),
         };
 
@@ -291,7 +302,15 @@ impl DnssecValidator {
             return DnssecStatus::InsecureUnknown;
         }
 
-        Self::validate_rrset(recursor, &final_owner, rtype, &target_records, all_records, budget).await
+        Self::validate_rrset(
+            recursor,
+            &final_owner,
+            rtype,
+            &target_records,
+            all_records,
+            budget,
+        )
+        .await
     }
 
     async fn validate_rrset(
@@ -387,7 +406,9 @@ impl DnssecValidator {
             let zone = rrsig.signer_name();
 
             match Self::build_trust_chain(recursor, zone, budget).await {
-                ChainResult::Trusted { keys: trusted_keys, .. } => {
+                ChainResult::Trusted {
+                    keys: trusted_keys, ..
+                } => {
                     any_trusted_chain = true;
                     for dnskey in &trusted_keys {
                         if !budget.can_check_sig() {
@@ -400,8 +421,8 @@ impl DnssecValidator {
 
                         let key_tag = compute_key_tag(dnskey).unwrap_or(u16::MAX);
                         let tag_match = key_tag == rrsig.key_tag();
-                        let sig_ok = tag_match
-                            && Self::verify_rrsig(rrsig, dnskey, owner, target_records);
+                        let sig_ok =
+                            tag_match && Self::verify_rrsig(rrsig, dnskey, owner, target_records);
 
                         if sig_ok {
                             return DnssecStatus::Secure;
@@ -475,7 +496,11 @@ impl DnssecValidator {
             })
             .unwrap_or_else(|| qname.clone());
 
-        if !zone.zone_of(&final_target) && zone != final_target && !zone.zone_of(qname) && zone != *qname {
+        if !zone.zone_of(&final_target)
+            && zone != final_target
+            && !zone.zone_of(qname)
+            && zone != *qname
+        {
             tracing::warn!(
                 zone = %zone,
                 qname = %qname,
@@ -557,9 +582,7 @@ impl DnssecValidator {
                     return None;
                 }
                 match r.data() {
-                    RData::DNSSEC(DNSSECRData::RRSIG(sig))
-                        if sig.type_covered() == rtype =>
-                    {
+                    RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => {
                         Some(sig.clone())
                     }
                     _ => None,
@@ -707,7 +730,8 @@ impl DnssecValidator {
             return status;
         }
 
-        let mut closest = find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations);
+        let mut closest =
+            find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations);
 
         if closest.is_none() && qtype == RecordType::DS {
             closest = Some(qname.base_name());
@@ -722,11 +746,15 @@ impl DnssecValidator {
             return DnssecStatus::Bogus;
         }
 
-        if let Some(status) = check_nsec3_wildcard_nodata(&closest, qtype, &nsec3_records, &salt, iterations) {
+        if let Some(status) =
+            check_nsec3_wildcard_nodata(&closest, qtype, &nsec3_records, &salt, iterations)
+        {
             return status;
         }
 
-        if let Some(status) = check_nsec3_nxdomain(qname, &closest, qtype, &nsec3_records, &salt, iterations) {
+        if let Some(status) =
+            check_nsec3_nxdomain(qname, &closest, qtype, &nsec3_records, &salt, iterations)
+        {
             return status;
         }
 
@@ -811,9 +839,15 @@ impl DnssecValidator {
 
                 if ds_records.is_empty() {
                     let authority = ds_msg.name_servers();
-                    let denial_status = if authority.iter().any(|r| r.record_type() == RecordType::NSEC3) {
+                    let denial_status = if authority
+                        .iter()
+                        .any(|r| r.record_type() == RecordType::NSEC3)
+                    {
                         Self::validate_nsec3(parent_keys, zone, RecordType::DS, authority, budget)
-                    } else if authority.iter().any(|r| r.record_type() == RecordType::NSEC) {
+                    } else if authority
+                        .iter()
+                        .any(|r| r.record_type() == RecordType::NSEC)
+                    {
                         Self::validate_nsec(parent_keys, zone, RecordType::DS, authority, budget)
                     } else {
                         DnssecStatus::Bogus
@@ -869,7 +903,9 @@ impl DnssecValidator {
                     for key in parent_keys {
                         if key.key_tag_matches(rrsig.key_tag()) {
                             if !budget.can_check_sig() {
-                                tracing::warn!("[DNSSEC] Work budget exhausted verifying DS; Bogus");
+                                tracing::warn!(
+                                    "[DNSSEC] Work budget exhausted verifying DS; Bogus"
+                                );
                                 return ChainResult::Bogus;
                             }
                             if Self::verify_rrsig(rrsig, key, zone, &ds_full_records) {
@@ -991,7 +1027,9 @@ impl DnssecValidator {
                 for key in &matched_keys {
                     if key.key_tag_matches(rrsig.key_tag()) {
                         if !budget.can_check_sig() {
-                            tracing::warn!("[DNSSEC] Work budget exhausted verifying DNSKEY; Bogus");
+                            tracing::warn!(
+                                "[DNSSEC] Work budget exhausted verifying DNSKEY; Bogus"
+                            );
                             return ChainResult::Bogus;
                         }
                         if Self::verify_rrsig(rrsig, key, zone, &dnskey_full_records) {
@@ -1038,7 +1076,10 @@ impl DnssecValidator {
         }
 
         match trusted_parent_keys {
-            Some(keys) => ChainResult::Trusted { keys, ttl: last_ttl },
+            Some(keys) => ChainResult::Trusted {
+                keys,
+                ttl: last_ttl,
+            },
             None => ChainResult::Unsigned { ttl: last_ttl },
         }
     }
@@ -1480,11 +1521,12 @@ async fn is_zone_signed(
         }
     };
 
-    let (signedness, proof_ttl) = match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
-        ChainResult::Trusted { ttl, .. } => (ZoneSignedness::Signed, ttl),
-        ChainResult::Unsigned { ttl } => (ZoneSignedness::ProvenUnsigned, ttl),
-        ChainResult::Bogus => (ZoneSignedness::Unknown, 0),
-    };
+    let (signedness, proof_ttl) =
+        match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
+            ChainResult::Trusted { ttl, .. } => (ZoneSignedness::Signed, ttl),
+            ChainResult::Unsigned { ttl } => (ZoneSignedness::ProvenUnsigned, ttl),
+            ChainResult::Bogus => (ZoneSignedness::Unknown, 0),
+        };
 
     if signedness != ZoneSignedness::Unknown {
         cache.insert(
@@ -1648,10 +1690,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| {
-            s.get(i..i + 2)
-                .and_then(|b| u8::from_str_radix(b, 16).ok())
-        })
+        .map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
         .collect()
 }
 
@@ -1749,12 +1788,12 @@ fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], s
             let Some((exponent, modulus)) = parse_rsa_public_key(pubkey_bytes) else {
                 return false;
             };
-            let verify_alg: &'static signature::RsaParameters =
-                if algorithm == Algorithm::RSASHA256 {
-                    &signature::RSA_PKCS1_2048_8192_SHA256
-                } else {
-                    &signature::RSA_PKCS1_2048_8192_SHA512
-                };
+            let verify_alg: &'static signature::RsaParameters = if algorithm == Algorithm::RSASHA256
+            {
+                &signature::RSA_PKCS1_2048_8192_SHA256
+            } else {
+                &signature::RSA_PKCS1_2048_8192_SHA512
+            };
             let components = signature::RsaPublicKeyComponents {
                 n: modulus,
                 e: exponent,

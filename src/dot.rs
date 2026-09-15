@@ -34,7 +34,8 @@ pub async fn run_dot_listener(
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor_ref.accept(stream)).await {
+                            match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor_ref.accept(stream)).await
+                            {
                                 Ok(Ok(tls_stream)) => {
                                     // RFC 7858 §3.3: handle_length_prefixed_stream manages the
                                     // multi-query loop, 2-byte frame length, and idle timeouts.

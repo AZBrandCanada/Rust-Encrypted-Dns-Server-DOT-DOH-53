@@ -65,19 +65,9 @@ async fn handle_doh_get(
 
     // Distinguish missing parameter vs empty parameter
     let encoded = match params.dns {
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Missing 'dns' query parameter",
-            )
-                .into_response()
-        }
+        None => return (StatusCode::BAD_REQUEST, "Missing 'dns' query parameter").into_response(),
         Some(ref d) if d.trim().is_empty() => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Empty 'dns' query parameter",
-            )
-                .into_response()
+            return (StatusCode::BAD_REQUEST, "Empty 'dns' query parameter").into_response()
         }
         Some(ref d) => d.trim(),
     };
@@ -88,13 +78,15 @@ async fn handle_doh_get(
             return (StatusCode::BAD_REQUEST, "Empty decoded DNS query payload").into_response()
         }
         Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response(),
     };
 
     if raw_bytes.len() > MAX_DOH_PAYLOAD {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "DNS query exceeds size limit").into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "DNS query exceeds size limit",
+        )
+            .into_response();
     }
 
     let client_ip = extract_client_ip(&headers, &peer);
@@ -116,7 +108,11 @@ async fn handle_doh_post(
     let ct_valid = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.trim().to_ascii_lowercase().starts_with("application/dns-message"))
+        .map(|ct| {
+            ct.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/dns-message")
+        })
         .unwrap_or(false);
 
     if !ct_valid {
@@ -141,7 +137,11 @@ async fn handle_doh_post(
     }
 
     if body.len() > MAX_DOH_PAYLOAD {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "DNS query exceeds size limit").into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "DNS query exceeds size limit",
+        )
+            .into_response();
     }
 
     let client_ip = extract_client_ip(&headers, &peer);
@@ -187,14 +187,21 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "status": "healthy",
         "cached_records": state.cache.len(),
     });
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], payload.to_string())
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        payload.to_string(),
+    )
 }
 
 /// Resolves the originating client IP.
 /// Reverse proxy headers are only trusted if the connection originates from loopback (e.g. Nginx).
 fn extract_client_ip(headers: &HeaderMap, peer: &SocketAddr) -> IpAddr {
     if peer.ip().is_loopback() {
-        if let Some(cf_ip) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+        if let Some(cf_ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Ok(ip) = cf_ip.trim().parse::<IpAddr>() {
                 return ip;
             }
@@ -229,7 +236,10 @@ fn decode_dns_param(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 fn make_dns_response(bytes: Vec<u8>) -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "application/dns-message".parse().unwrap());
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/dns-message".parse().unwrap(),
+    );
     headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     headers.insert(

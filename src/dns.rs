@@ -106,7 +106,8 @@ pub async fn run_tcp_listener(
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            handle_length_prefixed_stream(stream, state_ref, "TCP", peer.ip()).await;
+                            handle_length_prefixed_stream(stream, state_ref, "TCP", peer.ip())
+                                .await;
                         });
                     }
                     Err(_) => {

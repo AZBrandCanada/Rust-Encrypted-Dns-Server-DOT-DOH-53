@@ -48,7 +48,10 @@ impl ProcessOutcome {
 }
 
 fn is_cacheable(msg: &Message) -> bool {
-    matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain)
+    matches!(
+        msg.response_code(),
+        ResponseCode::NoError | ResponseCode::NXDomain
+    )
 }
 
 fn is_cacheable_dnssec(status: DnssecStatus) -> bool {
@@ -243,7 +246,10 @@ pub async fn process_dns_query(
     };
 
     // Rate Limiting check
-    match state.rate_limiter.check_query(protocol, client_ip, &qname, qtype) {
+    match state
+        .rate_limiter
+        .check_query(protocol, client_ip, &qname, qtype)
+    {
         RrlAction::Allow => {}
         RrlAction::Truncate => {
             tracing::warn!(
@@ -289,8 +295,7 @@ pub async fn process_dns_query(
                     let in_flight_clone = state.in_flight.clone();
 
                     tokio::spawn(async move {
-                        if let Ok(mut fresh_msg) =
-                            recursor_clone.resolve(&name_clone, qtype).await
+                        if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await
                         {
                             let status = DnssecValidator::validate_message(
                                 &recursor_clone,
@@ -337,9 +342,7 @@ pub async fn process_dns_query(
                                         },
                                     );
                                 }
-                            } else if let Some(mut existing) =
-                                cache_clone.get_mut(&key_clone)
-                            {
+                            } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
                                 existing.last_revalidated_at = now_secs();
                             }
                         }
@@ -370,7 +373,10 @@ pub async fn process_dns_query(
                         wire.len(),
                         client_max_payload,
                     ) {
-                        return ProcessOutcome::Truncated(make_truncated_wire(req_msg.id(), Some(query)));
+                        return ProcessOutcome::Truncated(make_truncated_wire(
+                            req_msg.id(),
+                            Some(query),
+                        ));
                     }
 
                     return ProcessOutcome::Success(wire);
@@ -384,13 +390,8 @@ pub async fn process_dns_query(
     // ---------------------------------------------------------------------
     match state.recursor.resolve(&qname, qtype).await {
         Ok(mut resp_msg) => {
-            let dnssec_status = DnssecValidator::validate_message(
-                &state.recursor,
-                &resp_msg,
-                &qname,
-                qtype,
-            )
-            .await;
+            let dnssec_status =
+                DnssecValidator::validate_message(&state.recursor, &resp_msg, &qname, qtype).await;
 
             let client_cd = req_msg.checking_disabled();
 
@@ -468,7 +469,9 @@ pub async fn process_dns_query(
                 now,
             ) {
                 Some(w) => w,
-                None => return ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), Some(query))),
+                None => {
+                    return ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), Some(query)))
+                }
             };
 
             tracing::info!(

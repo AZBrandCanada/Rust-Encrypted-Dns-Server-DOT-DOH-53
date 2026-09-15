@@ -8,9 +8,21 @@ use zip::ZipArchive;
 const MAX_DOWNLOAD_SIZE_BYTES: u64 = 25 * 1024 * 1024;
 
 pub const EMBEDDED_FALLBACK: &[&str] = &[
-    "google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com",
-    "reddit.com", "netflix.com", "bing.com", "microsoft.com", "apple.com",
-    "github.com", "cloudflare.com", "archlinux.org", "ubuntu.com", "example.com",
+    "google.com",
+    "youtube.com",
+    "facebook.com",
+    "wikipedia.org",
+    "amazon.com",
+    "reddit.com",
+    "netflix.com",
+    "bing.com",
+    "microsoft.com",
+    "apple.com",
+    "github.com",
+    "cloudflare.com",
+    "archlinux.org",
+    "ubuntu.com",
+    "example.com",
 ];
 
 pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String> {
@@ -23,7 +35,11 @@ pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String
     if path.exists() {
         if let Ok(domains) = load_from_file(path, limit) {
             if domains.len() >= limit {
-                tracing::info!(path = file_path, count = domains.len(), "[TRANCO] Using local domain list file");
+                tracing::info!(
+                    path = file_path,
+                    count = domains.len(),
+                    "[TRANCO] Using local domain list file"
+                );
                 return domains;
             }
         }
@@ -32,7 +48,10 @@ pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String
     tracing::info!(limit, "[TRANCO] Downloading Tranco Top 1M list archive...");
     match download_and_extract(limit).await {
         Ok(domains) => {
-            tracing::info!(count = domains.len(), "[TRANCO] Extracted domains; saving to disk");
+            tracing::info!(
+                count = domains.len(),
+                "[TRANCO] Extracted domains; saving to disk"
+            );
             if let Ok(mut f) = File::create(path) {
                 for d in &domains {
                     let _ = writeln!(f, "{}", d);
@@ -42,7 +61,11 @@ pub async fn get_or_download_tranco(file_path: &str, limit: usize) -> Vec<String
         }
         Err(err) => {
             tracing::warn!(error = %err, "[TRANCO] Download failed; using built-in fallback domain list");
-            EMBEDDED_FALLBACK.iter().take(limit).map(|s| s.to_string()).collect()
+            EMBEDDED_FALLBACK
+                .iter()
+                .take(limit)
+                .map(|s| s.to_string())
+                .collect()
         }
     }
 }
@@ -57,7 +80,10 @@ fn load_from_file(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let domain = trimmed.split_once(',').map(|(_, d)| d.trim()).unwrap_or(trimmed);
+        let domain = trimmed
+            .split_once(',')
+            .map(|(_, d)| d.trim())
+            .unwrap_or(trimmed);
         if !domain.is_empty() {
             domains.push(domain.to_string());
             if domains.len() >= limit {
@@ -68,13 +94,18 @@ fn load_from_file(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
     Ok(domains)
 }
 
-async fn download_and_extract(limit: usize) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+async fn download_and_extract(
+    limit: usize,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("doh-server-tranco-updater/1.0")
         .build()?;
 
-    let resp = client.get("https://tranco-list.eu/top-1m.csv.zip").send().await?;
+    let resp = client
+        .get("https://tranco-list.eu/top-1m.csv.zip")
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(format!("Server returned HTTP {}", resp.status()).into());
     }
@@ -97,7 +128,10 @@ async fn download_and_extract(limit: usize) -> Result<Vec<String>, Box<dyn std::
             if trimmed.is_empty() {
                 continue;
             }
-            let domain = trimmed.split_once(',').map(|(_, d)| d.trim()).unwrap_or(trimmed);
+            let domain = trimmed
+                .split_once(',')
+                .map(|(_, d)| d.trim())
+                .unwrap_or(trimmed);
             if !domain.is_empty() {
                 domains.push(domain.to_string());
                 if domains.len() >= limit {

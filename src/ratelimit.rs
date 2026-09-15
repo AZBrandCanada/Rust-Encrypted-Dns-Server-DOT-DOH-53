@@ -106,21 +106,27 @@ impl RateLimiter {
                     .compare_exchange(last_refill, now_ms, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    let _ = bucket.tokens.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                        |curr| Some((curr + new_tokens).min(self.capacity)),
-                    );
+                    let _ =
+                        bucket
+                            .tokens
+                            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
+                                Some((curr + new_tokens).min(self.capacity))
+                            });
                 }
             }
         }
 
         // Point 24: Atomically verify and consume a token; prevents tokens from going negative under contention
-        let token_acquired = bucket.tokens.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-            |curr| if curr > 0 { Some(curr - 1) } else { None },
-        );
+        let token_acquired =
+            bucket
+                .tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
+                    if curr > 0 {
+                        Some(curr - 1)
+                    } else {
+                        None
+                    }
+                });
 
         if token_acquired.is_err() {
             return RrlAction::Drop;
@@ -151,28 +157,32 @@ impl RateLimiter {
 
         let penalty = domain_entry.penalized_until_sec.load(Ordering::Acquire);
         if now_s < penalty {
-            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Release);
+            domain_entry
+                .penalized_until_sec
+                .store(now_s + 3, Ordering::Release);
             return RrlAction::Drop;
         }
 
         // Point 25: Atomic epoch transition and query counting in a single hardware transaction.
         // Upper 32 bits = epoch seconds, lower 32 bits = count.
         let mut query_count = 1;
-        let _ = domain_entry.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |val| {
-            let curr_epoch = (val >> 32) as i64;
-            let curr_count = (val & 0xFFFF_FFFF) as i64;
+        let _ = domain_entry
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |val| {
+                let curr_epoch = (val >> 32) as i64;
+                let curr_count = (val & 0xFFFF_FFFF) as i64;
 
-            if now_s > curr_epoch {
-                // New second: atomically advance epoch to now_s and reset count to 1
-                query_count = 1;
-                Some(((now_s as u64) << 32) | 1u64)
-            } else {
-                // Same second: increment count
-                let new_count = (curr_count + 1).min(u32::MAX as i64);
-                query_count = new_count;
-                Some(((curr_epoch as u64) << 32) | (new_count as u64))
-            }
-        });
+                if now_s > curr_epoch {
+                    // New second: atomically advance epoch to now_s and reset count to 1
+                    query_count = 1;
+                    Some(((now_s as u64) << 32) | 1u64)
+                } else {
+                    // Same second: increment count
+                    let new_count = (curr_count + 1).min(u32::MAX as i64);
+                    query_count = new_count;
+                    Some(((curr_epoch as u64) << 32) | (new_count as u64))
+                }
+            });
 
         if query_count == 1 {
             RrlAction::Allow
@@ -180,7 +190,9 @@ impl RateLimiter {
             // Force client to prove authentic IP via TCP handshake (mitigates IP spoofing)
             RrlAction::Truncate
         } else {
-            domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Release);
+            domain_entry
+                .penalized_until_sec
+                .store(now_s + 3, Ordering::Release);
             RrlAction::Drop
         }
     }

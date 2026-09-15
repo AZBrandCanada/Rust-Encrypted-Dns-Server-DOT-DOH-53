@@ -104,7 +104,11 @@ fn decode_response(buf: &[u8]) -> Result<Message, hickory_proto::ProtoError> {
 }
 
 /// RFC 6672 DNAME suffix substitution with strict length validation.
-pub fn dname_substitute(name: &Name, dname_owner: &Name, target: &Name) -> Result<Name, ResponseCode> {
+pub fn dname_substitute(
+    name: &Name,
+    dname_owner: &Name,
+    target: &Name,
+) -> Result<Name, ResponseCode> {
     if !dname_owner.zone_of(name) || dname_owner == name {
         return Err(ResponseCode::FormErr);
     }
@@ -178,7 +182,13 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
                 return false;
             }
             let seg = v6.segments();
-            if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xffff {
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0xffff
+            {
                 let mapped = Ipv4Addr::new(
                     (seg[6] >> 8) as u8,
                     (seg[6] & 0xff) as u8,
@@ -193,7 +203,9 @@ fn is_safe_upstream_ip(ip: IpAddr) -> bool {
 }
 
 fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
-    ips.into_iter().filter(|ip| is_safe_upstream_ip(*ip)).collect()
+    ips.into_iter()
+        .filter(|ip| is_safe_upstream_ip(*ip))
+        .collect()
 }
 
 /// Merges an alias redirection hop into the target response.
@@ -231,7 +243,11 @@ fn merge_redirection_response(
     }
 
     for r in final_msg.answers() {
-        if !final_response.answers().iter().any(|existing| existing == r) {
+        if !final_response
+            .answers()
+            .iter()
+            .any(|existing| existing == r)
+        {
             final_response.add_answer(r.clone());
         }
     }
@@ -247,7 +263,12 @@ fn merge_redirection_response(
             r.record_type(),
             RecordType::NSEC | RecordType::NSEC3 | RecordType::RRSIG
         );
-        if is_dnssec && !final_response.name_servers().iter().any(|existing| existing == r) {
+        if is_dnssec
+            && !final_response
+                .name_servers()
+                .iter()
+                .any(|existing| existing == r)
+        {
             final_response.add_name_server(r.clone());
         }
     }
@@ -261,7 +282,12 @@ fn merge_redirection_response(
 
     for r in first_hop_msg.additionals() {
         let is_dnssec = matches!(r.record_type(), RecordType::RRSIG | RecordType::DNSKEY);
-        if is_dnssec && !final_response.additionals().iter().any(|existing| existing == r) {
+        if is_dnssec
+            && !final_response
+                .additionals()
+                .iter()
+                .any(|existing| existing == r)
+        {
             final_response.add_additional(r.clone());
         }
     }
@@ -297,20 +323,26 @@ impl RecursiveResolver {
                 return Err(RecursorError::DepthExceeded);
             }
 
-            let start_ips = self
-                .find_cached_start(name, rtype)
-                .unwrap_or_else(|| ROOT_SERVERS.iter().filter_map(|ip| ip.parse().ok()).collect());
-            let mut current_servers: Vec<SocketAddr> =
-                start_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
+            let start_ips = self.find_cached_start(name, rtype).unwrap_or_else(|| {
+                ROOT_SERVERS
+                    .iter()
+                    .filter_map(|ip| ip.parse().ok())
+                    .collect()
+            });
+            let mut current_servers: Vec<SocketAddr> = start_ips
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, 53))
+                .collect();
 
             let mut last_zone: Option<Name> = None;
             let mut bailiwick: Name = Name::root();
 
             for _step in 0..MAX_STEPS {
-                let response = match Self::query_servers_with_fallback(&current_servers, name, rtype).await {
-                    Some(r) => r,
-                    None => return Err(RecursorError::AllNameserversFailed),
-                };
+                let response =
+                    match Self::query_servers_with_fallback(&current_servers, name, rtype).await {
+                        Some(r) => r,
+                        None => return Err(RecursorError::AllNameserversFailed),
+                    };
 
                 // 1. Exact positive answer, CNAME, or DNAME redirection
                 if !response.answers().is_empty() {
@@ -359,7 +391,9 @@ impl RecursiveResolver {
                             }
 
                             let next_cname = response.answers().iter().find_map(|r| {
-                                if r.name() == &current_target && r.record_type() == RecordType::CNAME {
+                                if r.name() == &current_target
+                                    && r.record_type() == RecordType::CNAME
+                                {
                                     if let RData::CNAME(cname) = r.data() {
                                         Some(cname.0.clone())
                                     } else {
@@ -387,12 +421,17 @@ impl RecursiveResolver {
                             .resolve_internal(&current_target, rtype, depth + 1, visited)
                             .await?;
 
-                        return Ok(merge_redirection_response(name, rtype, &response, cname_resp));
+                        return Ok(merge_redirection_response(
+                            name, rtype, &response, cname_resp,
+                        ));
                     }
 
                     // B. Check for DNAME
                     let dname_match = response.answers().iter().find_map(|r| {
-                        if r.record_type() == DNAME_RECORD_TYPE && r.name().zone_of(name) && r.name() != name {
+                        if r.record_type() == DNAME_RECORD_TYPE
+                            && r.name().zone_of(name)
+                            && r.name() != name
+                        {
                             if let Some(target) = extract_dname_target(r) {
                                 return Some((r.name().clone(), target, r.ttl()));
                             }
@@ -426,7 +465,8 @@ impl RecursiveResolver {
                                     return Ok(working_response);
                                 }
 
-                                let key = format!("dname:{}", substituted.to_string().to_lowercase());
+                                let key =
+                                    format!("dname:{}", substituted.to_string().to_lowercase());
                                 if visited.contains(&key) {
                                     tracing::warn!(target = %substituted, "[RECURSOR] DNAME loop detected; aborting");
                                     return Err(RecursorError::NoProgress);
@@ -437,7 +477,12 @@ impl RecursiveResolver {
                                     .resolve_internal(&substituted, rtype, depth + 1, visited)
                                     .await?;
 
-                                return Ok(merge_redirection_response(name, rtype, &working_response, dname_resp));
+                                return Ok(merge_redirection_response(
+                                    name,
+                                    rtype,
+                                    &working_response,
+                                    dname_resp,
+                                ));
                             }
                             Err(ResponseCode::YXDomain) => {
                                 tracing::warn!(
@@ -469,7 +514,8 @@ impl RecursiveResolver {
                 if let Some(soa_zone) = authoritative_soa {
                     let is_soa_authoritative = soa_zone.zone_of(name)
                         || soa_zone == name
-                        || (rtype == RecordType::DS && (name.zone_of(soa_zone) || soa_zone.zone_of(name)));
+                        || (rtype == RecordType::DS
+                            && (name.zone_of(soa_zone) || soa_zone.zone_of(name)));
 
                     if is_soa_authoritative {
                         return Ok(response);
@@ -526,8 +572,11 @@ impl RecursiveResolver {
                     return Err(RecursorError::NoProgress);
                 }
 
-                let is_child_of_target = delegation_owner.zone_of(name) || &delegation_owner == name;
-                let is_within_bailiwick = bailiwick.is_root() || bailiwick.zone_of(&delegation_owner) || bailiwick == delegation_owner;
+                let is_child_of_target =
+                    delegation_owner.zone_of(name) || &delegation_owner == name;
+                let is_within_bailiwick = bailiwick.is_root()
+                    || bailiwick.zone_of(&delegation_owner)
+                    || bailiwick == delegation_owner;
                 if !is_child_of_target || !is_within_bailiwick {
                     tracing::warn!(
                         delegation = %delegation_owner,
@@ -638,7 +687,10 @@ impl RecursiveResolver {
                 bailiwick = active_delegation.clone();
                 last_zone = Some(active_delegation);
 
-                current_servers = next_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
+                current_servers = next_ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, 53))
+                    .collect();
             }
 
             Err(RecursorError::StepLimitExceeded)
@@ -744,7 +796,11 @@ impl RecursiveResolver {
 
         let req_bytes = query_msg.to_bytes()?;
 
-        let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind_addr = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
             Err(e) => {
@@ -819,7 +875,9 @@ impl RecursiveResolver {
                 stream.read_exact(&mut len_buf).await?;
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
                 if !(12..=65535).contains(&resp_len) {
-                    return Err(RecursorError::Proto(hickory_proto::ProtoError::from("Invalid TCP frame length")));
+                    return Err(RecursorError::Proto(hickory_proto::ProtoError::from(
+                        "Invalid TCP frame length",
+                    )));
                 }
 
                 let mut tcp_buf = vec![0u8; resp_len];
@@ -845,7 +903,9 @@ impl RecursiveResolver {
                         stream.read_exact(&mut len_buf).await?;
                         let resp_len = u16::from_be_bytes(len_buf) as usize;
                         if !(12..=65535).contains(&resp_len) {
-                            return Err(RecursorError::Proto(hickory_proto::ProtoError::from("Invalid TCP frame length")));
+                            return Err(RecursorError::Proto(hickory_proto::ProtoError::from(
+                                "Invalid TCP frame length",
+                            )));
                         }
                         let mut tcp_buf = vec![0u8; resp_len];
                         stream.read_exact(&mut tcp_buf).await?;
@@ -868,12 +928,7 @@ impl RecursiveResolver {
     }
 }
 
-fn response_matches(
-    response: &Message,
-    txid: u16,
-    sent_name: &Name,
-    rtype: RecordType,
-) -> bool {
+fn response_matches(response: &Message, txid: u16, sent_name: &Name, rtype: RecordType) -> bool {
     if response.id() != txid || response.message_type() != MessageType::Response {
         return false;
     }
