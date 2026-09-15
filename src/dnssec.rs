@@ -1,11 +1,14 @@
 use crate::cache::now_secs;
-use crate::recursor::{calculate_min_ttl, dname_substitute, RecursiveResolver};
+use crate::recursor::{
+    calculate_min_ttl, dname_substitute, extract_dname_target, DNAME_RECORD_TYPE,
+    RecursiveResolver,
+};
 use dashmap::DashMap;
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, Nsec3HashAlgorithm, PublicKey};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 use ml_dsa::signature::Verifier;
 use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
@@ -211,7 +214,7 @@ impl DnssecValidator {
                     // RFC 6672 §3.3: DNAME RRset validation
                     let dname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| r.name() == dname_owner && r.record_type() == RecordType::DNAME)
+                        .filter(|r| r.name() == dname_owner && r.record_type() == DNAME_RECORD_TYPE)
                         .cloned()
                         .collect();
 
@@ -222,7 +225,7 @@ impl DnssecValidator {
                     match Self::validate_rrset(
                         recursor,
                         dname_owner,
-                        RecordType::DNAME,
+                        DNAME_RECORD_TYPE,
                         &dname_records,
                         all_records,
                         budget,
@@ -640,7 +643,6 @@ impl DnssecValidator {
             return DnssecStatus::InsecureUnknown;
         }
 
-        // Require consistent parameters across all participating NSEC3 records
         for &rec in &nsec3_records {
             match rec.data() {
                 RData::DNSSEC(DNSSECRData::NSEC3(n)) => {
@@ -1320,14 +1322,13 @@ fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChai
 
         // 2. Matching DNAME check
         let dname_step = records.iter().find_map(|r| {
-            if r.record_type() == RecordType::DNAME
+            if r.record_type() == DNAME_RECORD_TYPE
                 && r.name().zone_of(&current)
                 && r.name() != &current
             {
-                if let RData::DNAME(d) = r.data() {
-                    let sub = dname_substitute(&current, r.name(), &d.0)?;
-                    return Some((r.name().clone(), d.0.clone(), sub));
-                }
+                let target = extract_dname_target(r)?;
+                let sub = dname_substitute(&current, r.name(), &target)?;
+                return Some((r.name().clone(), target, sub));
             }
             None
         });
