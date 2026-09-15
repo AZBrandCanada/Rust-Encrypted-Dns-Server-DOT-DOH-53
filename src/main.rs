@@ -268,8 +268,8 @@ async fn bind_tcp(
 /// Pre-warms the cache with canonical, client-agnostic validated DNS responses.
 ///
 /// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
-/// (ID, RD, CD, DO) cleared, allowing `src/engine.rs` to dynamically construct appropriate
-/// client-tailored wire responses on demand.
+/// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated, allowing
+/// `src/engine.rs` to dynamically construct appropriate client-tailored wire responses on demand.
 async fn preload_domains(
     cache: DnsCache,
     recursor: Arc<RecursiveResolver>,
@@ -352,6 +352,7 @@ async fn preload_domains(
                                         min_ttl: ttl,
                                         cached_at: now,
                                         last_revalidated_at: now,
+                                        dnssec_status: status, // Store explicit DNSSEC status directly
                                     },
                                 );
                                 warmed_ref.fetch_add(1, Ordering::Relaxed);

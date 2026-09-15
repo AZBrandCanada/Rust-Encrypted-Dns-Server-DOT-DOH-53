@@ -142,17 +142,25 @@ fn construct_client_response(
 
     client_resp.set_authentic_data(ad);
 
-    // 3. TTL aging and DO=0 presentation filtering
+// 3. TTL aging and DO=0 presentation filtering
     let age = now.saturating_sub(cached_at) as u32;
+
+    // RFC 8767 §4: Fresh data gets aged TTL; stale data gets a positive 30-second TTL.
+    let compute_ttl = |orig_ttl: u32| -> u32 {
+        match freshness {
+            CacheFreshness::Fresh => orig_ttl.saturating_sub(age),
+            CacheFreshness::Stale => crate::cache::STALE_SERVE_TTL,
+            CacheFreshness::Expired => 0,
+        }
+    };
 
     // Answers section
     for r in base_msg.answers() {
-        // RFC 4035 §3.2.1: Strip DNSSEC RRs if DO=0 unless explicitly requested
         if !client_dnssec_ok && is_dnssec_record(r.record_type()) && r.record_type() != qtype {
             continue;
         }
         let mut rec = r.clone();
-        rec.set_ttl(rec.ttl().saturating_sub(age));
+        rec.set_ttl(compute_ttl(rec.ttl()));
         client_resp.add_answer(rec);
     }
 
@@ -162,7 +170,7 @@ fn construct_client_response(
             continue;
         }
         let mut rec = r.clone();
-        rec.set_ttl(rec.ttl().saturating_sub(age));
+        rec.set_ttl(compute_ttl(rec.ttl()));
         client_resp.add_name_server(rec);
     }
 
@@ -175,10 +183,9 @@ fn construct_client_response(
             continue;
         }
         let mut rec = r.clone();
-        rec.set_ttl(rec.ttl().saturating_sub(age));
+        rec.set_ttl(compute_ttl(rec.ttl()));
         client_resp.add_additional(rec);
     }
-
     // 4. EDNS0 (OPT) handling (RFC 6891 §6.1.1)
     // Only return an OPT record if the client sent an OPT record in the request
     if req_msg.extensions().is_some() {
@@ -319,6 +326,7 @@ pub async fn process_dns_query(
                                             min_ttl: ttl,
                                             cached_at: cur_time,
                                             last_revalidated_at: cur_time,
+                                            dnssec_status: status,
                                         },
                                     );
                                 }
@@ -335,11 +343,8 @@ pub async fn process_dns_query(
 
             let mut decoder = BinDecoder::new(&entry.raw_wire);
             if let Ok(cached_msg) = Message::read(&mut decoder) {
-                let cached_status = if cached_msg.authentic_data() {
-                    DnssecStatus::Secure
-                } else {
-                    DnssecStatus::InsecureUnsigned
-                };
+                // Retrieve DNSSEC validation state directly from the cache entry (Point 3)
+                let cached_status = entry.dnssec_status;
 
                 if let Some(wire) = construct_client_response(
                     &cached_msg,
@@ -429,6 +434,7 @@ pub async fn process_dns_query(
                             min_ttl: ttl,
                             cached_at: now,
                             last_revalidated_at: now,
+                            dnssec_status,
                         },
                     );
                 }

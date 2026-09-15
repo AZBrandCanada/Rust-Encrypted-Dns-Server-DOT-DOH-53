@@ -16,6 +16,7 @@ use ml_dsa::{
 };
 use ring::digest;
 use ring::signature;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -27,7 +28,7 @@ const MAX_NSEC3_ITERATIONS: u16 = 150;           // RFC 9276 recommendation
 const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;    // Bounded walk
 const MAX_CNAME_CHAIN: usize = 16;               // Bounded CNAME/DNAME chain walk
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DnssecStatus {
     Secure,
     InsecureUnsigned,

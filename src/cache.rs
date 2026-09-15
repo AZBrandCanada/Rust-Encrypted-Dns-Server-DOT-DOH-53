@@ -1,8 +1,5 @@
+use crate::dnssec::DnssecStatus;
 use dashmap::DashMap;
-use hickory_proto::dnssec::rdata::DNSSECRData;
-use hickory_proto::op::Message;
-use hickory_proto::rr::{RData, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,6 +9,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_STALE_SECS: u64 = 300;
+
+/// RFC 8767 §4: Recommended small positive TTL (in seconds) when serving stale responses.
+pub const STALE_SERVE_TTL: u32 = 30;
 
 /// Retrieves the configured maximum allowable stale duration.
 /// Can be overridden via the `MAX_STALE_SECS` environment variable.
@@ -31,7 +31,7 @@ pub enum CacheFreshness {
     /// Within authoritative TTL; immediately servable without background revalidation.
     Fresh,
     /// Authoritative TTL has elapsed, but within the allowable stale-while-revalidate window.
-    /// May be served to clients (with TTL=0 and AD=0) while triggering background resolution.
+    /// Served to clients with a 30-second stale TTL and AD=0 while triggering background resolution.
     Stale,
     /// Has exceeded the maximum stale window; must be discarded and never served.
     Expired,
@@ -60,6 +60,10 @@ mod base64_bytes {
     }
 }
 
+fn default_dnssec_status() -> DnssecStatus {
+    DnssecStatus::InsecureUnsigned
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
     #[serde(with = "base64_bytes")]
@@ -67,6 +71,8 @@ pub struct CacheEntry {
     pub min_ttl: u32,
     pub cached_at: u64,
     pub last_revalidated_at: u64,
+    #[serde(default = "default_dnssec_status")]
+    pub dnssec_status: DnssecStatus,
 }
 
 impl CacheEntry {
@@ -87,86 +93,6 @@ impl CacheEntry {
         } else {
             CacheFreshness::Expired
         }
-    }
-
-    /// Prepares a client-facing wire buffer from the cached entry:
-    /// 1. Decrements all Resource Record TTLs according to elapsed age (RFC 2181):
-    ///    `remaining_ttl = max(original_ttl - age, 0)`.
-    /// 2. Skips OPT records (RFC 6891) so EDNS flags/extended RCODE are never corrupted.
-    /// 3. Preserves immutable RRSIG RDATA `Original TTL` for DNSSEC validation integrity.
-    /// 4. Strips the `AD` (Authentic Data) bit if data is served stale (RFC 8767 §6)
-    ///    or if any RRSIG has surpassed its cryptographic expiration.
-    /// 5. Injects the client's query Transaction ID and flags.
-    pub fn prepare_client_wire(
-        &self,
-        client_txid: u16,
-        now: u64,
-    ) -> Option<(Vec<u8>, CacheFreshness)> {
-        self.prepare_client_wire_with_flags(client_txid, true, false, now)
-    }
-
-    /// Prepares a client-facing response wire buffer with explicit RD and CD flags.
-    pub fn prepare_client_wire_with_flags(
-        &self,
-        client_txid: u16,
-        recursion_desired: bool,
-        checking_disabled: bool,
-        now: u64,
-    ) -> Option<(Vec<u8>, CacheFreshness)> {
-        let freshness = self.freshness(now);
-        if freshness == CacheFreshness::Expired {
-            return None;
-        }
-
-        let mut decoder = BinDecoder::new(&self.raw_wire);
-        let mut msg = Message::read(&mut decoder).ok()?;
-
-        // Adapt headers for the requesting client
-        msg.set_id(client_txid);
-        msg.set_recursion_desired(recursion_desired);
-        msg.set_checking_disabled(checking_disabled);
-        msg.set_recursion_available(true);
-
-        let age = now.saturating_sub(self.cached_at) as u32;
-
-        // Decrement outer RR TTLs across all sections.
-        // OPT records are explicitly excluded as their TTL field stores EDNS0 metadata.
-        for record in msg.answers_mut() {
-            if record.record_type() != RecordType::OPT {
-                record.set_ttl(record.ttl().saturating_sub(age));
-            }
-        }
-        for record in msg.name_servers_mut() {
-            if record.record_type() != RecordType::OPT {
-                record.set_ttl(record.ttl().saturating_sub(age));
-            }
-        }
-        for record in msg.additionals_mut() {
-            if record.record_type() != RecordType::OPT {
-                record.set_ttl(record.ttl().saturating_sub(age));
-            }
-        }
-
-        // RFC 8767 §6: Stale responses MUST NOT be served with AD=1.
-        // Also ensure no expired RRSIG can ever be served as authenticated data.
-        let has_expired_rrsig = msg
-            .answers()
-            .iter()
-            .chain(msg.name_servers().iter())
-            .any(|r| {
-                if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
-                    (sig.sig_expiration().get() as u64) < now
-                } else {
-                    false
-                }
-            });
-
-        if freshness == CacheFreshness::Stale || has_expired_rrsig {
-            msg.set_authentic_data(false);
-        }
-
-        let wire = msg.to_bytes().ok()?;
-        Some((wire, freshness))
     }
 }
 

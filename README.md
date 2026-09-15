@@ -2,13 +2,13 @@
 
 A high-performance, lightweight, multi-protocol recursive DNS resolver engineered in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) concurrently while performing independent, from-the-root iterative resolution without relying on upstream third-party resolvers (such as Google, Cloudflare, or Quad9).
 
-Built with comprehensive DNSSEC validation (including authenticated denial of existence, authenticated DS denial, RFC 6672 DNAME synthesis, RFC 1982 serial arithmetic, and post-quantum ML-DSA-44), anti-amplification defenses, SSRF immunity, and an RFC 8767 stale-while-revalidate caching engine with dynamic TTL aging.
+Built with production-grade security, comprehensive DNSSEC validation (including authenticated denial of existence, authenticated DS denial, RFC 6672 DNAME synthesis, RFC 1982 serial arithmetic, and post-quantum ML-DSA-44), anti-amplification defenses, SSRF immunity, and an RFC 8767 stale-while-revalidate caching engine with dynamic TTL aging.
 
 ---
 
 ## Architecture & Request Pipeline
 
-All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, caching, and response-construction engine. There are no transport-specific shortcuts or divergences for DNSSEC validation or `AD` bit semantics.
+All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, validation, caching, and client-tailoring pipeline. The resolver strictly separates **canonical resolver state** from **client-specific wire representation**: the cache never stores client flags or mutated wire headers.
 
 ```text
        UDP :53 ───┐
@@ -25,39 +25,47 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
   (Single-question enforcement, subnet token bucket, UDP duplicate-domain RRL, ANY drop)
          │
          ▼
-   Unified DNS Engine
-         │
-         ├── Canonical Cache Look-up (Fresh / Stale / Expired)
-         │
-         └── Iterative Recursor
-                  │
-                  ▼
-          DNSSEC Validation Engine
-          (Trust chain, KSK/ZSK, NSEC/NSEC3, RFC 1982 serial arithmetic, ML-DSA-44)
-                  │
-                  ▼
-          Validated Canonical Data
-          ({qname}:{qtype}:IN canonical storage)
-                  │
-                  ▼
-  Client-Specific Response Construction Pipeline
- ┌─────────────────────────────────────────────────────────────┐
- │ 1. Decrement outer record TTLs by elapsed age (RFC 2181)    │
- │    (Original TTL in RRSIG RDATA and OPT records untouched)  │
- │ 2. Apply client Transaction ID and echo RD / CD flags       │
- │ 3. Determine AD flag (RFC 4035 §3.2.2/3, RFC 6840 §5.7/8):  │
- │    - Requires DnssecStatus::Secure                          │
- │    - Requires fresh data (AD=0 if stale per RFC 8767 §6)    │
- │    - Requires client signaling via DO=1 or request AD=1     │
- │    - Requires CD=0                                          │
- │ 4. Filter DNSSEC records if DO=0 (RFC 4035 §3.2.1)          │
- │    (Preserves records explicitly queried, e.g. DS, DNSKEY)  │
- │ 5. Construct client EDNS0 OPT record (or omit if no EDNS)   │
- │ 6. Set RA=1, AA=0, and serialize wire response              │
- └─────────────────────────────────────────────────────────────┘
+  Recursive Resolution & Validation
          │
          ▼
-   Client Response
+  DNSSEC Validation Engine
+         │
+      ┌──┴────────────────────────┐
+      │                           │
+      ▼                           ▼
+Canonical DNS Data           DnssecStatus
+      │           (Secure, InsecureUnsigned, etc.)
+      └───────────┬───────────────┘
+                  ▼
+             CacheEntry
+  ({qname}:{qtype}:IN canonical storage)
+                  │
+                  ▼
+           Cache Freshness
+    (Fresh / Stale / Expired)
+                  │
+                  ▼
+  Client Response Construction Pipeline
+ ┌─────────────────────────────────────────────────────────────┐
+ │ 1. Compute client-visible wire TTL:                         │
+ │    - Fresh: decremented remaining TTL = max(TTL - age, 0)   │
+ │    - Stale: RFC 8767 positive 30-second TTL                 │
+ │    (Cryptographic Original TTL in RRSIG RDATA is untouched) │
+ │ 2. Inquire DnssecStatus from CacheEntry (authoritative)     │
+ │ 3. Determine AD flag (RFC 4035 §3.2.2/3, RFC 6840 §5.7/8):  │
+ │    - Requires DnssecStatus::Secure                          │
+ │    - Requires fresh data (strictly AD=0 if served stale)    │
+ │    - Requires client signaling via DO=1 or request AD=1     │
+ │    - Requires CD=0 in request                               │
+ │ 4. Filter DNSSEC records if DO=0 (RFC 4035 §3.2.1)          │
+ │    (Preserves records explicitly queried, e.g. DS, DNSKEY)  │
+ │ 5. Inject client Transaction ID and echo RD / CD flags      │
+ │ 6. Construct client EDNS0 OPT record (or omit if no EDNS)   │
+ │ 7. Set RA=1, AA=0, and serialize wire response              │
+ └─────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+           Final DNS Response
 ```
 
 ---
@@ -68,17 +76,17 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
 * **Concurrent Protocol Serving**: Simultaneously accepts plain UDP/TCP queries on port 53, DNS-over-TLS (DoT) on port 853 with ALPN `dot`, and DNS-over-HTTPS (DoH) via HTTP/1.1 and HTTP/2 on port 443 in a single async runtime.
 * **Strict RFC 8484 DoH Implementation**:
   * Supports both `GET` (base64url query parameter) and `POST` (binary `application/dns-message` body).
-  * Distinguishes missing `?dns` parameters from empty ones (**HTTP 400 Bad Request**).
-  * Distinguishes client-side malformed wire format (**HTTP 400 Bad Request**) from valid queries resulting in resolution errors (**HTTP 200 OK** carrying `RCODE=SERVFAIL` wire data).
-  * Enforces `Content-Type: application/dns-message` on POST requests before payload evaluation, rejecting unsupported types with **HTTP 415 Unsupported Media Type**.
+  * Distinguishes missing `?dns` query parameters from empty ones (**HTTP 400 Bad Request**).
+  * Distinguishes client-side malformed wire format (**HTTP 400 Bad Request**) from valid queries resulting in resolution errors (**HTTP 200 OK** carrying `RCODE=SERVFAIL` wire payload).
+  * Enforces `Content-Type: application/dns-message` on POST requests before payload evaluation, rejecting missing or invalid types with **HTTP 415 Unsupported Media Type**.
   * Validates the client's `Accept` header, returning **HTTP 406 Not Acceptable** if incompatible with `application/dns-message`.
   * Rejects rate-limited queries with **HTTP 429 Too Many Requests**.
 * **RFC 7858 & RFC 7766 TCP/DoT Framing**:
   * Implements standard 2-byte big-endian framing supporting payloads up to **65,535 bytes (64 KB)**, accommodating large post-quantum DNSSEC responses.
   * Supports multi-query pipelining and persistent connection reuse across both plain TCP and TLS sessions.
-  * Enforces a 10-second idle timeout and a 5-second active I/O timeout. Connection tear-down occurs cleanly on unexpected EOF or I/O failure without processing partial buffers.
+  * Enforces a 10-second idle timeout and a 5-second active I/O timeout. Connections tear down cleanly on unexpected EOF or socket errors without processing partial buffers.
 * **Non-Truncating UDP Socket Architecture**: Sizes socket receive buffers to **64 KB (65,535 bytes)**, preventing the operating system kernel from silently truncating incoming datagrams to smaller user-space buffers. Queries exceeding standard UDP size (> 4,096 bytes) are cleanly dropped.
-* **Reverse-Proxy Ready (DoH Offload)**: Supports unencrypted HTTP backend mode (`DOH_NO_TLS=1`) for deployment behind reverse proxies like Nginx or Caddy.
+* **Reverse-Proxy Ready (DoH Offload)**: Supports unencrypted HTTP backend mode (`DOH_NO_TLS=1`) for local deployment behind reverse proxies like Nginx or Caddy.
 * **Auto-Generating Dev Certificates**: Automatically generates a self-signed development certificate on startup using `rcgen` (securing the private key with `0600` permissions on Unix) if existing PEM files are not found.
 * **Unprivileged Port Fallbacks**: Automatically falls back to high ports (DNS: `5053`, DoT: `8853`, DoH: `8443`) if started without `root` privileges or `CAP_NET_BIND_SERVICE`.
 * **Bounded Concurrency**: Governed by Tokio semaphores (2048 UDP permits, 512 TCP permits, 512 DoT permits) to prevent file descriptor exhaustion.
@@ -86,7 +94,7 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
 ### Iterative Root Recursion
 * **Autonomous Resolution**: Queries authoritative nameservers iteratively starting from the 13 IANA root nameserver clusters (`a.root-servers.net` through `m.root-servers.net`).
 * **Dual-Stack Nameserver Racing (IPv4 Prioritized)**: Resolves both `A` and `AAAA` glue records for upstream nameservers. Nameserver address candidates are sorted with IPv4 prioritized first and queried in concurrent batches of 3, eliminating resolution hangs on systems lacking IPv6 routing.
-* **Intra-Response CNAME Chain Traversal**: Recursively traverses bundled multi-hop CNAME alias chains directly within upstream responses, eliminating redundant network queries when an authoritative server includes the entire chain.
+* **Intra-Response CNAME Chain Traversal**: Traverses bundled multi-hop CNAME alias chains directly within upstream responses, eliminating redundant network queries when an authoritative server includes the entire chain.
 * **RFC 6672 DNAME Synthesis**: Detects delegation name (`DNAME`, Type 39) records, performs canonical suffix replacement (`dname_substitute`), synthesizes the required `CNAME` RR inheriting the DNAME's TTL if absent, and returns `YXDOMAIN` if a synthesized name exceeds 255 octets.
 * **Rejection of Unrelated Answer Records**: Refuses to terminate resolution on non-matching answer records. A response must contain the requested type, an applicable CNAME, or an applicable DNAME to be considered positive; otherwise it falls through to authoritative SOA or referral classification.
 * **Strict Referral & Bailiwick Rules (RFC 2181 §5.4.1)**: Additional records are only accepted as authoritative glue if they belong to an advertised nameserver and are in-bailiwick of the answering zone. Out-of-bailiwick addresses are treated as untrusted hints and resolved independently, preventing Kaminsky glue-poisoning attacks.
@@ -99,8 +107,8 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
 
 ### Cryptographic DNSSEC Engine (Classical & Post-Quantum)
 * **Full Trust Chain Validation**: Walks the chain of trust top-down from hardcoded root anchors down through DS and DNSKEY records to authenticate RRSIGs.
-* **Current Root Anchors**: Built-in verification for root KSK-2017 (Key Tag `20326`) and root KSK-2024 (Key Tag `38696`). Fails closed (`SERVFAIL`) on broken trust chains when enforcement is enabled.
-* **RFC 1982 Serial Number Arithmetic**: Compares RRSIG signature inception and expiration timestamps using 32-bit serial arithmetic rather than naive integer comparisons, ensuring correct validation around the 32-bit timestamp rollover boundary.
+* **Current Root Anchors (Strict Fail-Closed)**: Built-in verification for root KSK-2017 (Key Tag `20326`) and root KSK-2024 (Key Tag `38696`). If a root trust anchor or intermediate chain cannot be authenticated, validation strictly **fails closed** resulting in `Bogus` $\rightarrow$ `SERVFAIL` when enforcement is enabled.
+* **RFC 1982 Serial Number Arithmetic**: Compares RRSIG signature inception and expiration timestamps using 32-bit serial arithmetic rather than naive integer comparisons, ensuring correct validation around the 32-bit timestamp rollover boundary (RFC 4034 §3.1.5).
 * **Triple-Backend Verification Architecture**:
   * **Optimized Classical Engine (`ring`)**: Hardware-accelerated verification for RSA (`RSASHA256`, `RSASHA512`, strictly bounded to 2048–8192 bits), ECDSA (`ECDSAP256SHA256`, `ECDSAP384SHA384`), and Ed25519 (`ED25519`).
   * **Post-Quantum Engine (`ml-dsa` / RustCrypto)**: Full FIPS 204 verification for ML-DSA-44 (`Algorithm 18`), bypassing protocol libraries that lack Algorithm 18 support.
@@ -108,7 +116,7 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
 * **Post-Quantum Cryptography (ML-DSA-44 / Algorithm 18)**: Validates ML-DSA-44 lattice signatures per **NIST FIPS 204** and **draft-ietf-dnsop-ml-dsa-dnssec**. Zones signed with Algorithm 18 validate with `AD=1`; forged, expired, or missing signatures fail closed.
 * **RFC 4035 §5.2 KSK/ZSK Trust Model & Zone Key Filtering**: Authenticates the child DNSKEY RRset using parent DS-matched keys (KSKs). Authenticates all keys in the validated RRset possessing the `Zone Key` flag (bit 7 = 1) for subsequent zone record verification.
 * **RFC 4034 §6.2 Canonical Wire Serialization**: Converts owner names and RRSIG signer names to lowercase in wire-format buffers prior to TBS digest calculation, preventing digest mismatches on Base32hex NSEC3 owner names.
-* **Authenticated Denial of DS Nonexistence**: Rejection of empty DS responses unless accompanied by cryptographically verified parent NSEC or NSEC3 denial proofs. Missing or unverified DS denial proofs are declared `Bogus` → `SERVFAIL`, defeating on-path DS-stripping downgrade attacks.
+* **Authenticated Denial of DS Nonexistence**: Rejection of empty DS responses unless accompanied by cryptographically verified parent NSEC or NSEC3 denial proofs. Missing or unverified DS denial proofs are declared `Bogus` $\rightarrow$ `SERVFAIL`, defeating on-path DS-stripping downgrade attacks.
 * **Per-Validation Cryptographic Work Budget (KeyTrap / CVE-2023-50387)**: Operates a dedicated `ValidationBudget` (`PER_VALIDATION_MAX_SIG_CHECKS = 24`) tracking signature operations across positive validations, negative proofs, DS verifications, and DNSKEY self-signatures for each query, preventing algorithmic CPU-exhaustion DoS.
 * **Decomposed NSEC Proof Architecture (RFC 4035 §5.4)**:
   * **Direct NODATA**: Verifies matching owner, ensures `qtype` and `CNAME` bits are absent, and ensures `SOA` is absent for DS queries.
@@ -123,20 +131,20 @@ All inbound transports (UDP, TCP, DoT, DoH) share a single, unified resolution, 
 * **RFC 4034 §6.3 Canonical Sorting**: Reorders RRset members strictly by canonical RDATA octets prior to digest verification.
 
 ### Caching Engine (RFC 8767 Stale-While-Revalidate & Dynamic TTLs)
-* **Client-Agnostic Canonical Storage**: Cache entries are keyed strictly by `{qname}:{qtype}:IN`, storing canonical validated DNS response wire data. Client-specific fields (`ID`, `RD`, `CD`, `DO` filtering, `AD` computation, aged TTLs) are synthesized dynamically on response.
-* **Dynamic TTL Aging (RFC 2181)**:
-  * Record TTLs are aged dynamically based on elapsed time:
+* **Client-Agnostic Canonical Storage**: Cache entries are keyed strictly by `{qname}:{qtype}:IN`, storing canonical validated DNS response wire data alongside an explicit `DnssecStatus` source of truth. There is **no DO=0 / DO=1 cache partitioning**; client-specific representations are synthesized on the fly.
+* **Dynamic TTL Aging vs. Cryptographic Original TTL**:
+  * Client-facing outer record TTLs age down dynamically with elapsed time:
     $$\text{remaining\_ttl} = \max(\text{original\_ttl} - \text{age}, 0)$$
   * The cryptographic `Original TTL` inside RRSIG RDATA is preserved untouched for downstream DNSSEC validation.
   * `RecordType::OPT` records are skipped during aging so EDNS payload sizes and extended RCODEs remain intact.
 * **Typed Cache Freshness Policy**:
-  * **`Fresh`** ($\text{age} < \text{TTL}$): Served immediately with aged TTLs.
-  * **`Stale`** ($\text{TTL} \le \text{age} < \text{TTL} + \text{MAX\_STALE}$): Served with TTL=0; triggers asynchronous background revalidation. Per RFC 8767 §6, stale responses **strictly set `AD=0`**.
+  * **`Fresh`** ($\text{age} < \text{TTL}$): Served immediately with aged remaining TTLs.
+  * **`Stale`** ($\text{TTL} \le \text{age} < \text{TTL} + \text{MAX\_STALE}$): Served with a **positive 30-second TTL** (RFC 8767 §4) to prevent downstream flooding while triggering asynchronous background revalidation. Per RFC 8767 §6, stale responses **strictly set `AD=0`**.
   * **`Expired`** ($\text{age} \ge \text{TTL} + \text{MAX\_STALE}$): **Never served**. Bypasses cache and triggers synchronous iterative resolution. If resolution fails, returns `SERVFAIL` rather than resurrecting zombie records.
-* **Configurable Stale Window**: Maximum stale duration is governed by `MAX_STALE_SECS` (default: 300 seconds).
+* **Configurable Stale Window**: Maximum stale duration is governed by `MAX_STALE_SECS` (default: 300 seconds). This defines the maximum window the resolver is willing to serve stale data, separate from the 30-second TTL placed on wire responses.
 * **Startup Cache Persistence Hygiene**:
-  * `load_cache_from_disk()` evaluates the age of all entries on startup; any record exceeding its allowable stale age is discarded to prevent zombie record resurrection.
-  * Cache is atomically persisted to disk every 120 seconds and on shutdown (`.tmp` write followed by rename).
+  * `load_cache_from_disk()` evaluates the age of all entries on startup; any record exceeding its allowable stale age is discarded to prevent zombie record resurrection. Older cache formats missing `dnssec_status` safely fall back to `InsecureUnsigned`.
+  * Cache is atomically persisted to disk every 120 seconds and on clean shutdown (`.tmp` write followed by rename).
 * **Single-Flight Request Deduplication**: An in-flight synchronization registry (`in_flight`) prevents duplicate concurrent background revalidations for the same RRset.
 * **Tranco Cache Pre-warming**: Automatically downloads and unzips the Tranco Top 1M list on startup, populating the cache with canonical validated responses. Pre-warming neutralizes all client flags (`ID=0`, `RD=0`, `CD=0`) before storing.
 
