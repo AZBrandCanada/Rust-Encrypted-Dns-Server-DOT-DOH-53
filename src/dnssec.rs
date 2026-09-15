@@ -433,7 +433,7 @@ impl DnssecValidator {
             return DnssecStatus::Bogus;
         }
 
-        tracing::warn!(
+        tracing::debug!(
             owner = %owner,
             qtype = ?rtype,
             "[DNSSEC] Validation fell through all RRSIGs with unsigned chains; Insecure"
