@@ -35,17 +35,6 @@ pub enum ProcessOutcome {
     Malformed,
 }
 
-impl ProcessOutcome {
-    /// Converts the outcome into wire format for transport layers that only handle raw bytes.
-    pub fn into_wire(self) -> Vec<u8> {
-        match self {
-            ProcessOutcome::Success(wire)
-            | ProcessOutcome::ServFail(wire)
-            | ProcessOutcome::Truncated(wire) => wire,
-            ProcessOutcome::Dropped | ProcessOutcome::Malformed => Vec::new(),
-        }
-    }
-}
 
 fn is_cacheable(msg: &Message) -> bool {
     matches!(
@@ -110,6 +99,7 @@ pub fn calculate_cache_ttl(msg: &Message, status: DnssecStatus, now: u64) -> u32
 /// 5. Filters DNSSEC records (RRSIG, NSEC, NSEC3) if client DO=0 (RFC 4035 §3.2.1),
 ///    unless the client explicitly queried for that specific record type.
 /// 6. Adds or suppresses the EDNS0 OPT record depending on whether the client sent EDNS.
+#[allow(clippy::too_many_arguments)]
 fn construct_client_response(
     base_msg: &Message,
     qtype: RecordType,
@@ -507,16 +497,7 @@ pub async fn process_dns_query(
     }
 }
 
-pub async fn process_dns_wire(
-    req_wire: &[u8],
-    state: &AppState,
-    protocol: &'static str,
-    client_ip: IpAddr,
-) -> Vec<u8> {
-    process_dns_query(req_wire, state, protocol, client_ip)
-        .await
-        .into_wire()
-}
+
 
 pub fn make_truncated_wire(id: u16, query: Option<&hickory_proto::op::Query>) -> Vec<u8> {
     let mut msg = Message::new();

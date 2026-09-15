@@ -485,8 +485,7 @@ impl DnssecValidator {
         let final_target = msg
             .answers()
             .iter()
-            .filter(|r| r.record_type() == RecordType::CNAME)
-            .next_back()
+            .rfind(|r| r.record_type() == RecordType::CNAME)
             .and_then(|r| {
                 if let RData::CNAME(cname) = r.data() {
                     Some(cname.0.clone())
@@ -495,7 +494,6 @@ impl DnssecValidator {
                 }
             })
             .unwrap_or_else(|| qname.clone());
-
         if !zone.zone_of(&final_target)
             && zone != final_target
             && !zone.zone_of(qname)

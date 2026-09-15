@@ -6,7 +6,6 @@ use std::sync::Arc;
 pub struct LoadedCert {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
-    pub is_self_signed: bool,
     pub cert_file: String,
     pub key_file: String,
 }
@@ -30,7 +29,7 @@ pub fn load_or_generate(
         return Ok(LoadedCert {
             certs,
             key,
-            is_self_signed: false,
+  
             cert_file: cert_path.to_string(),
             key_file: key_path.to_string(),
         });
@@ -73,7 +72,7 @@ pub fn load_or_generate(
     Ok(LoadedCert {
         certs,
         key,
-        is_self_signed: true,
+
         cert_file: "selfsigned_cert.pem".to_string(),
         key_file: "selfsigned_key.pem".to_string(),
     })
