@@ -530,7 +530,6 @@ impl DnssecValidator {
 
         let authority: Vec<Record> = msg.name_servers().to_vec();
 
-        // Point 11: Authenticate the SOA RRset as required by RFC 4035 §5.4
         if let Some(soa_rec) = soa {
             if !Self::verify_negative_rrset(soa_rec, &authority, &keys, budget) {
                 tracing::warn!(
@@ -1048,8 +1047,6 @@ impl DnssecValidator {
 
             let dnskey_ttl = calculate_min_ttl(&dnskey_msg);
 
-            // Points 9 & 10: The cached authenticated zone keys cannot safely outlive
-            // either the DNSKEY RRset itself OR the parent DS record that authenticated it.
             let effective_ttl = if zone.is_root() {
                 dnskey_ttl
             } else {
@@ -1438,12 +1435,66 @@ fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChai
     RedirectionChainResult::Complete(chain)
 }
 
+/// Locates the real authoritative zone apex for a name without following CNAMEs
+/// to foreign CDN domains.
+async fn find_zone_apex(recursor: &RecursiveResolver, name: &Name) -> Option<Name> {
+    let mut candidate = name.clone();
+    loop {
+        if let Ok(msg) = recursor.resolve(&candidate, RecordType::SOA).await {
+            // 1. Direct answer: apex returned its own SOA
+            for ans in msg.answers() {
+                if ans.name() == &candidate && ans.record_type() == RecordType::SOA {
+                    return Some(candidate);
+                }
+            }
+
+            // 2. An apex cannot be a CNAME (RFC 2181 §10.1). If candidate is a CNAME,
+            // it is a record, not a zone cut.
+            let is_cname = msg
+                .answers()
+                .iter()
+                .any(|r| r.name() == &candidate && r.record_type() == RecordType::CNAME);
+
+            if !is_cname {
+                let mut best_soa: Option<Name> = None;
+                for rec in msg.answers().iter().chain(msg.name_servers().iter()) {
+                    if matches!(rec.data(), RData::SOA(_)) {
+                        let soa_name = rec.name();
+                        // The SOA MUST be an ancestor suffix of our original query name!
+                        // This prevents foreign CNAME targets (like cloudflare.net) from hijacking the zone identity.
+                        if soa_name == name || soa_name.zone_of(name) {
+                            let is_better = match &best_soa {
+                                Some(current) => soa_name.num_labels() > current.num_labels(),
+                                None => true,
+                            };
+                            if is_better {
+                                best_soa = Some(soa_name.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(soa) = best_soa {
+                    return Some(soa);
+                }
+            }
+        }
+
+        if candidate.is_root() {
+            break;
+        }
+        candidate = candidate.base_name();
+    }
+    None
+}
+
 async fn is_zone_signed(
     recursor: &RecursiveResolver,
     name: &Name,
     budget: &mut ValidationBudget,
 ) -> ZoneSignedness {
     let cache = signed_zone_cache();
+
+    // 1. Check cache: if any ancestor zone is ProvenUnsigned, all descendants are ProvenUnsigned.
     let mut cur = name.clone();
     loop {
         let key = cur.to_string().to_lowercase();
@@ -1452,11 +1503,7 @@ async fn is_zone_signed(
                 match entry.signedness {
                     ZoneSignedness::ProvenUnsigned => return ZoneSignedness::ProvenUnsigned,
                     ZoneSignedness::Signed => {
-                        if cur.is_root() || cur.num_labels() <= 2 {
-                            if cur == *name {
-                                return ZoneSignedness::Signed;
-                            }
-                        } else {
+                        if cur == *name {
                             return ZoneSignedness::Signed;
                         }
                     }
@@ -1470,55 +1517,19 @@ async fn is_zone_signed(
         cur = cur.base_name();
     }
 
-    let mut apex_candidate = name.clone();
-    let mut zone = None;
-
-    while apex_candidate.num_labels() > 2 {
-        if let Ok(m) = recursor.resolve(&apex_candidate, RecordType::SOA).await {
-            let found = m
-                .answers()
-                .iter()
-                .chain(m.name_servers().iter())
-                .find_map(|r| {
-                    if matches!(r.data(), RData::SOA(_)) {
-                        Some(r.name().clone())
-                    } else {
-                        None
-                    }
-                });
-            if let Some(z) = found {
-                zone = Some(z);
-                break;
-            }
-        }
-        apex_candidate = apex_candidate.base_name();
-    }
-
-    let zone = match zone {
+    // 2. Discover the true authoritative zone apex for `name`
+    let zone = match find_zone_apex(recursor, name).await {
         Some(z) => z,
         None => {
-            let m = match recursor.resolve(&apex_candidate, RecordType::SOA).await {
-                Ok(m) => m,
-                Err(_) => return ZoneSignedness::Unknown,
-            };
-            let z = m
-                .answers()
-                .iter()
-                .chain(m.name_servers().iter())
-                .find_map(|r| {
-                    if matches!(r.data(), RData::SOA(_)) {
-                        Some(r.name().clone())
-                    } else {
-                        None
-                    }
-                });
-            match z {
-                Some(zone_name) => zone_name,
-                None => return ZoneSignedness::Unknown,
+            if name.is_root() {
+                Name::root()
+            } else {
+                name.base_name()
             }
         }
     };
 
+    // 3. Authenticate the delegation trust chain from the root down to the discovered apex
     let (signedness, proof_ttl) =
         match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
             ChainResult::Trusted { ttl, .. } => (ZoneSignedness::Signed, ttl),

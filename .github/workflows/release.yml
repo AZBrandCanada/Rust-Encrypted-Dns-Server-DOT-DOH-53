@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -75,7 +75,7 @@ jobs:
           cp target/${{ matrix.target }}/release/unified-dns dist/${{ matrix.artifact }}/unified-dns
           cp README.md dist/${{ matrix.artifact }}/README.md
           cp LICENSE dist/${{ matrix.artifact }}/LICENSE
-          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
 
       - name: Generate checksum
         run: |
@@ -87,7 +87,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/${{ matrix.artifact }}.tar.gz
-            dist/${{ matrix.artifact }}.sha256
+            dist/${{ matrix.artifact }}.tar.gz.sha256
 
   release:
     name: Create GitHub Release
