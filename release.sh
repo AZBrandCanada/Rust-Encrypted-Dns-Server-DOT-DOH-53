@@ -11,13 +11,13 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 echo "========================================"
-echo " Unified DNS Release Preflight"
+echo " Unified DNS Release"
 echo " Version: ${VERSION}"
 echo " Tag:     ${TAG}"
 echo "========================================"
 echo
 
-echo "[1/10] Checking required files..."
+echo "[1/12] Checking required files..."
 
 for file in Cargo.toml Cargo.lock README.md LICENSE .github/workflows/release.yml; do
     if [[ ! -f "$file" ]]; then
@@ -29,35 +29,42 @@ done
 echo "OK"
 echo
 
-echo "[2/10] Checking Git working tree..."
+echo "[2/12] Formatting source..."
 
-if [[ -n "$(git status --porcelain)" ]]; then
-    echo "ERROR: Git working tree is not clean."
-    echo
-    git status --short
-    echo
-    echo "Commit or stash your changes before releasing."
-    exit 1
-fi
+cargo fmt --all
 
 echo "OK"
 echo
 
-echo "[3/10] Checking Cargo.lock..."
+echo "[3/12] Checking Git working tree..."
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Changes detected after formatting:"
+    git status --short
+    echo
+    echo "These changes will be included in the release commit."
+else
+    echo "No uncommitted changes."
+fi
+
+echo
+
+echo "[4/12] Checking Cargo.lock..."
 
 if ! cargo metadata --locked --no-deps >/dev/null 2>&1; then
     echo "ERROR: Cargo.lock is missing or out of date."
-    echo "Run: cargo check"
     exit 1
 fi
 
 echo "OK"
 echo
 
-echo "[4/10] Checking release version..."
+echo "[5/12] Checking release version..."
 
-PACKAGE_VERSION="$(cargo metadata --format-version 1 --no-deps \
-    | sed -n 's/.*"name":"unified-dns","version":"\([^"]*\)".*/\1/p')"
+PACKAGE_VERSION="$(
+    cargo metadata --format-version 1 --no-deps |
+    sed -n 's/.*"name":"unified-dns","version":"\([^"]*\)".*/\1/p'
+)"
 
 if [[ "$PACKAGE_VERSION" != "$VERSION" ]]; then
     echo "ERROR: Cargo metadata version does not match Cargo.toml."
@@ -68,68 +75,82 @@ fi
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
     echo "ERROR: Git tag ${TAG} already exists."
-    echo "If you are intentionally recreating the tag, remove it manually first."
+    echo "Refusing to overwrite an existing release tag."
     exit 1
 fi
 
 echo "Version ${VERSION} OK"
 echo
 
-echo "[5/10] Running rustfmt..."
+echo "[6/12] Running format verification..."
 
 cargo fmt --all -- --check
 
 echo "OK"
 echo
 
-echo "[6/10] Running cargo check..."
+echo "[7/12] Running cargo check..."
 
 cargo check --release --locked
 
 echo "OK"
 echo
 
-echo "[7/10] Running tests..."
+echo "[8/12] Running tests..."
 
 cargo test --release --locked
 
 echo "OK"
 echo
 
-echo "[8/10] Running clippy..."
+echo "[9/12] Running clippy..."
 
 cargo clippy --release --locked --all-targets -- -D warnings
 
 echo "OK"
 echo
 
-echo "[9/10] Verifying release workflow packaging..."
+echo "[10/12] Verifying release workflow..."
 
 WORKFLOW=".github/workflows/release.yml"
 
 if ! grep -q 'cp LICENSE' "$WORKFLOW"; then
-    echo "WARNING: release workflow does not explicitly package LICENSE."
-fi
-
-if ! grep -q 'sha256sum "dist/\${{ matrix.artifact }}.tar.gz"' "$WORKFLOW"; then
-    echo "ERROR: release workflow checksum path does not match expected dist/ path."
+    echo "ERROR: Release workflow does not package LICENSE."
     exit 1
 fi
 
 if ! grep -q 'tar -C dist -czf "dist/\${{ matrix.artifact }}.tar.gz"' "$WORKFLOW"; then
-    echo "ERROR: release workflow archive path does not match expected dist/ path."
+    echo "ERROR: Release workflow archive path is incorrect."
+    exit 1
+fi
+
+if ! grep -q 'sha256sum "dist/\${{ matrix.artifact }}.tar.gz"' "$WORKFLOW"; then
+    echo "ERROR: Release workflow checksum path is incorrect."
+    exit 1
+fi
+
+if ! grep -q 'unified-dns-linux-x86_64' "$WORKFLOW"; then
+    echo "ERROR: x86_64 release target is missing."
+    exit 1
+fi
+
+if ! grep -q 'unified-dns-linux-aarch64' "$WORKFLOW"; then
+    echo "ERROR: ARM64 release target is missing."
     exit 1
 fi
 
 echo "OK"
 echo
 
-echo "[10/10] Checking release metadata..."
+echo "[11/12] Checking release metadata..."
 
-LICENSE_TYPE="$(sed -n 's/^license = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+LICENSE_TYPE="$(
+    sed -n 's/^license = "\(.*\)"/\1/p' Cargo.toml |
+    head -n1
+)"
 
 if [[ "$LICENSE_TYPE" == "MIT" && ! -s LICENSE ]]; then
-    echo "ERROR: Cargo.toml declares MIT license but LICENSE is empty."
+    echo "ERROR: Cargo.toml declares MIT license but LICENSE is missing or empty."
     exit 1
 fi
 
@@ -138,29 +159,31 @@ if [[ ! -s README.md ]]; then
     exit 1
 fi
 
+if [[ ! -f Cargo.lock ]]; then
+    echo "ERROR: Cargo.lock is missing."
+    exit 1
+fi
+
 echo "OK"
 echo
 
+echo "[12/12] Final Git status..."
+
+git status --short
+
+echo
 echo "========================================"
-echo " PRE-FLIGHT PASSED"
+echo " ALL PREFLIGHT CHECKS PASSED"
 echo "========================================"
 echo
-echo "Ready to release ${TAG}."
-echo
-echo "The following commands will be run:"
-echo
-echo "  git add -A"
-echo "  git commit -m \"Release ${TAG}\""
-echo "  git push origin main"
-echo "  git tag -a ${TAG} -m \"Unified DNS ${TAG}\""
-echo "  git push origin ${TAG}"
+echo "Release: ${TAG}"
 echo
 
-read -r -p "Create and push ${TAG}? [y/N] " CONFIRM
+read -r -p "Commit, push main, create ${TAG}, and push the tag? [y/N] " CONFIRM
 
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo
-    echo "Release cancelled. Nothing was committed or tagged."
+    echo "Release cancelled."
     exit 0
 fi
 
@@ -168,6 +191,12 @@ echo
 echo "[RELEASE] Committing..."
 
 git add -A
+
+if git diff --cached --quiet; then
+    echo "ERROR: Nothing to commit."
+    exit 1
+fi
+
 git commit -m "Release ${TAG}"
 
 echo
@@ -187,7 +216,7 @@ git push origin "$TAG"
 
 echo
 echo "========================================"
-echo " RELEASE ${TAG} PUSHED"
+echo " RELEASE ${TAG} PUSHED SUCCESSFULLY"
 echo "========================================"
 echo
-echo "GitHub Actions should now build and publish the release."
+echo "GitHub Actions will now build and publish the release."
