@@ -821,28 +821,78 @@ impl RecursiveResolver {
             .await
             .map_err(|_| RecursorError::AllNameserversFailed)??;
 
-        // 2. Decode UDP response with malformed Additional recovery & RFC 6891 §7 EDNS fallback
-        let mut used_edns = true;
+        // 2. Decode UDP response while preserving EDNS/DNSSEC semantics.
+        //
+        // Never silently downgrade a DNSSEC-capable query to a plain DNS query.
+        // If the authoritative server cannot answer the EDNS query over UDP,
+        // retry the same EDNS/DNSSEC query over TCP.
         let response = match decode_response(&buf[..n]) {
             Ok(resp) if resp.response_code() != ResponseCode::FormErr => resp,
-            _ => {
-                let mut plain_msg = Message::new();
-                plain_msg.set_id(txid);
-                plain_msg.set_message_type(MessageType::Query);
-                plain_msg.set_op_code(OpCode::Query);
-                plain_msg.set_recursion_desired(false);
-                plain_msg.set_checking_disabled(true);
-                plain_msg.add_query(query.clone());
+            Ok(resp) => {
+                tracing::debug!(
+                    ip = %addr.ip(),
+                    name = %name,
+                    rtype = ?rtype,
+                    rcode = ?resp.response_code(),
+                    "[RECURSOR] Upstream returned FORMERR to EDNS/DNSSEC query; retrying over TCP with EDNS"
+                );
 
-                let plain_bytes = plain_msg.to_bytes()?;
-                socket.send(&plain_bytes).await?;
-
-                let n = timeout(QUERY_TIMEOUT, socket.recv(&mut buf))
+                let mut stream = timeout(TCP_TIMEOUT, TcpStream::connect(addr))
                     .await
-                    .map_err(|_| RecursorError::AllNameserversFailed)??;
+                    .map_err(|_| RecursorError::AllNameserversFailed)?
+                    .map_err(|_| RecursorError::AllNameserversFailed)?;
 
-                used_edns = false;
-                decode_response(&buf[..n])?
+                let len = (req_bytes.len() as u16).to_be_bytes();
+                stream.write_all(&len).await?;
+                stream.write_all(&req_bytes).await?;
+
+                let mut len_buf = [0u8; 2];
+                stream.read_exact(&mut len_buf).await?;
+
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if !(12..=65535).contains(&resp_len) {
+                    return Err(RecursorError::Proto(hickory_proto::ProtoError::from(
+                        "Invalid TCP frame length",
+                    )));
+                }
+
+                let mut tcp_buf = vec![0u8; resp_len];
+                stream.read_exact(&mut tcp_buf).await?;
+
+                decode_response(&tcp_buf)?
+            }
+            Err(e) => {
+                tracing::debug!(
+                    ip = %addr.ip(),
+                    name = %name,
+                    rtype = ?rtype,
+                    error = %e,
+                    "[RECURSOR] Failed to decode EDNS/DNSSEC response; retrying over TCP with EDNS"
+                );
+
+                let mut stream = timeout(TCP_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| RecursorError::AllNameserversFailed)?
+                    .map_err(|_| RecursorError::AllNameserversFailed)?;
+
+                let len = (req_bytes.len() as u16).to_be_bytes();
+                stream.write_all(&len).await?;
+                stream.write_all(&req_bytes).await?;
+
+                let mut len_buf = [0u8; 2];
+                stream.read_exact(&mut len_buf).await?;
+
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if !(12..=65535).contains(&resp_len) {
+                    return Err(RecursorError::Proto(hickory_proto::ProtoError::from(
+                        "Invalid TCP frame length",
+                    )));
+                }
+
+                let mut tcp_buf = vec![0u8; resp_len];
+                stream.read_exact(&mut tcp_buf).await?;
+
+                decode_response(&tcp_buf)?
             }
         };
 
@@ -854,18 +904,7 @@ impl RecursiveResolver {
             let tcp_response = timeout(TCP_TIMEOUT, async {
                 let mut stream = TcpStream::connect(addr).await?;
 
-                let tcp_query_bytes = if used_edns {
-                    req_bytes
-                } else {
-                    let mut plain_msg = Message::new();
-                    plain_msg.set_id(txid);
-                    plain_msg.set_message_type(MessageType::Query);
-                    plain_msg.set_op_code(OpCode::Query);
-                    plain_msg.set_recursion_desired(false);
-                    plain_msg.set_checking_disabled(true);
-                    plain_msg.add_query(query.clone());
-                    plain_msg.to_bytes()?
-                };
+                let tcp_query_bytes = req_bytes.clone();
 
                 let len = (tcp_query_bytes.len() as u16).to_be_bytes();
                 stream.write_all(&len).await?;
@@ -883,36 +922,19 @@ impl RecursiveResolver {
                 let mut tcp_buf = vec![0u8; resp_len];
                 stream.read_exact(&mut tcp_buf).await?;
 
-                let tcp_msg = match decode_response(&tcp_buf) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let mut plain_msg = Message::new();
-                        plain_msg.set_id(txid);
-                        plain_msg.set_message_type(MessageType::Query);
-                        plain_msg.set_op_code(OpCode::Query);
-                        plain_msg.set_recursion_desired(false);
-                        plain_msg.set_checking_disabled(true);
-                        plain_msg.add_query(query.clone());
-                        let plain_bytes = plain_msg.to_bytes()?;
-
-                        let len = (plain_bytes.len() as u16).to_be_bytes();
-                        stream.write_all(&len).await?;
-                        stream.write_all(&plain_bytes).await?;
-
-                        let mut len_buf = [0u8; 2];
-                        stream.read_exact(&mut len_buf).await?;
-                        let resp_len = u16::from_be_bytes(len_buf) as usize;
-                        if !(12..=65535).contains(&resp_len) {
-                            return Err(RecursorError::Proto(hickory_proto::ProtoError::from(
-                                "Invalid TCP frame length",
-                            )));
-                        }
-                        let mut tcp_buf = vec![0u8; resp_len];
-                        stream.read_exact(&mut tcp_buf).await?;
-                        decode_response(&tcp_buf)?
+                match decode_response(&tcp_buf) {
+                    Ok(tcp_msg) => Ok(tcp_msg),
+                    Err(e) => {
+                        tracing::debug!(
+                            ip = %addr.ip(),
+                            name = %name,
+                            rtype = ?rtype,
+                            error = %e,
+                            "[RECURSOR] Failed to decode TCP response with EDNS/DNSSEC query"
+                        );
+                        Err(RecursorError::AllNameserversFailed)
                     }
-                };
-                Ok(tcp_msg)
+                }
             })
             .await
             .map_err(|_| RecursorError::AllNameserversFailed)?
