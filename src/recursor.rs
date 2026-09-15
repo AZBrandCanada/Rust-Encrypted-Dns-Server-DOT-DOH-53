@@ -209,10 +209,6 @@ fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
 }
 
 /// Merges an alias redirection hop into the target response.
-///
-/// Preserves the final result's RCODE, answers, authority, and additionals,
-/// while also merging any DNSSEC-relevant material (NSEC, NSEC3, RRSIG, DNSKEY) from
-/// the first redirection hop so the DNSSEC validator can authenticate the entire chain.
 fn merge_redirection_response(
     orig_name: &Name,
     orig_type: RecordType,
@@ -237,7 +233,7 @@ fn merge_redirection_response(
     q.set_query_class(DNSClass::IN);
     final_response.add_query(q);
 
-    // 1. Answers: first-hop records (CNAME/DNAME + RRSIGs) followed by final target answers
+    // 1. Answers: first-hop records followed by final target answers
     for r in first_hop_msg.answers() {
         final_response.add_answer(r.clone());
     }
@@ -252,8 +248,7 @@ fn merge_redirection_response(
         }
     }
 
-    // 2. Authority: final target authority records (SOA, NSEC/NSEC3), plus any
-    // DNSSEC proof records from the first hop (e.g. wildcard denial proofs)
+    // 2. Authority: final target authority records, plus any DNSSEC proofs from first hop
     for r in final_msg.name_servers() {
         final_response.add_name_server(r.clone());
     }
@@ -273,7 +268,7 @@ fn merge_redirection_response(
         }
     }
 
-    // 3. Additionals: final additionals, plus any first-hop DNSSEC records (excluding OPT)
+    // 3. Additionals
     for r in final_msg.additionals() {
         if r.record_type() != RecordType::OPT {
             final_response.add_additional(r.clone());
@@ -311,6 +306,24 @@ impl RecursiveResolver {
         self.resolve_internal(name, rtype, 0, &mut visited).await
     }
 
+    fn purge_delegation_for(&self, name: &Name, rtype: RecordType) {
+        let mut current = if rtype == RecordType::DS {
+            name.base_name()
+        } else {
+            name.clone()
+        };
+        loop {
+            let key = current.to_string().to_lowercase();
+            if self.delegation_cache.remove(&key).is_some() {
+                break;
+            }
+            if current.is_root() {
+                break;
+            }
+            current = current.base_name();
+        }
+    }
+
     fn resolve_internal<'a>(
         &'a self,
         name: &'a Name,
@@ -323,16 +336,19 @@ impl RecursiveResolver {
                 return Err(RecursorError::DepthExceeded);
             }
 
-            let start_ips = self.find_cached_start(name, rtype).unwrap_or_else(|| {
-                ROOT_SERVERS
+            let mut using_cached = false;
+            let start_ips = self.find_cached_start(name, rtype);
+            let mut current_servers: Vec<SocketAddr> = match start_ips {
+                Some(ips) if !ips.is_empty() => {
+                    using_cached = true;
+                    ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect()
+                }
+                _ => ROOT_SERVERS
                     .iter()
                     .filter_map(|ip| ip.parse().ok())
-                    .collect()
-            });
-            let mut current_servers: Vec<SocketAddr> = start_ips
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, 53))
-                .collect();
+                    .map(|ip| SocketAddr::new(ip, 53))
+                    .collect(),
+            };
 
             let mut last_zone: Option<Name> = None;
             let mut bailiwick: Name = Name::root();
@@ -341,8 +357,30 @@ impl RecursiveResolver {
                 let response =
                     match Self::query_servers_with_fallback(&current_servers, name, rtype).await {
                         Some(r) => r,
-                        None => return Err(RecursorError::AllNameserversFailed),
+                        None => {
+                            // If cached servers failed, refused, or timed out, purge the bad
+                            // delegation entry and self-heal by starting over from the root servers.
+                            if using_cached {
+                                tracing::warn!(
+                                    name = %name,
+                                    "[RECURSOR] Cached delegation servers failed or refused; purging cache and retrying from root"
+                                );
+                                using_cached = false;
+                                self.purge_delegation_for(name, rtype);
+                                current_servers = ROOT_SERVERS
+                                    .iter()
+                                    .filter_map(|ip| ip.parse().ok())
+                                    .map(|ip| SocketAddr::new(ip, 53))
+                                    .collect();
+                                last_zone = None;
+                                bailiwick = Name::root();
+                                continue;
+                            }
+                            return Err(RecursorError::AllNameserversFailed);
+                        }
                     };
+
+                using_cached = false;
 
                 // 1. Exact positive answer, CNAME, or DNAME redirection
                 if !response.answers().is_empty() {
@@ -628,9 +666,10 @@ impl RecursiveResolver {
                     );
                 }
 
-                // If glue was omitted (or out-of-bailiwick), iteratively resolve nameserver IPs
+                // If glue was omitted (or out-of-bailiwick), iteratively resolve nameserver IPs.
+                // Collect addresses across multiple nameservers to maintain redundancy.
                 if next_ips.is_empty() {
-                    for ns_name in &ns_names {
+                    for ns_name in ns_names.iter().take(4) {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
                         if !visited.contains(&key_ns) {
                             visited.insert(key_ns);
@@ -640,11 +679,9 @@ impl RecursiveResolver {
                                 .await
                             {
                                 for ans in ns_resp.answers() {
-                                    if ans.name() == ns_name {
-                                        if let RData::A(a) = ans.data() {
-                                            if is_safe_upstream_ip(IpAddr::V4(a.0)) {
-                                                next_ips.push(IpAddr::V4(a.0));
-                                            }
+                                    if let RData::A(a) = ans.data() {
+                                        if is_safe_upstream_ip(IpAddr::V4(a.0)) {
+                                            next_ips.push(IpAddr::V4(a.0));
                                         }
                                     }
                                 }
@@ -655,20 +692,24 @@ impl RecursiveResolver {
                                 .await
                             {
                                 for ans in ns_resp.answers() {
-                                    if ans.name() == ns_name {
-                                        if let RData::AAAA(aaaa) = ans.data() {
-                                            if is_safe_upstream_ip(IpAddr::V6(aaaa.0)) {
-                                                next_ips.push(IpAddr::V6(aaaa.0));
-                                            }
+                                    if let RData::AAAA(aaaa) = ans.data() {
+                                        if is_safe_upstream_ip(IpAddr::V6(aaaa.0)) {
+                                            next_ips.push(IpAddr::V6(aaaa.0));
                                         }
                                     }
                                 }
                             }
                         }
-                        if !next_ips.is_empty() {
+
+                        // Maintain redundancy by collecting up to 4 distinct nameserver IPs
+                        if next_ips.len() >= 4 {
                             break;
                         }
                     }
+
+                    // Deduplicate resolved IPs
+                    let mut seen_ips = HashSet::new();
+                    next_ips.retain(|ip| seen_ips.insert(*ip));
                 }
 
                 if next_ips.is_empty() {
@@ -740,7 +781,7 @@ impl RecursiveResolver {
         let mut prioritized_servers = v4;
         prioritized_servers.extend(v6);
 
-        // Iterate through all candidate servers in chunks of 3
+        // Iterate through candidate servers in chunks of 3
         for chunk in prioritized_servers.chunks(3) {
             let mut set = JoinSet::new();
             for &addr in chunk {
@@ -821,11 +862,6 @@ impl RecursiveResolver {
             .await
             .map_err(|_| RecursorError::AllNameserversFailed)??;
 
-        // 2. Decode UDP response while preserving EDNS/DNSSEC semantics.
-        //
-        // Never silently downgrade a DNSSEC-capable query to a plain DNS query.
-        // If the authoritative server cannot answer the EDNS query over UDP,
-        // retry the same EDNS/DNSSEC query over TCP.
         let response = match decode_response(&buf[..n]) {
             Ok(resp) if resp.response_code() != ResponseCode::FormErr => resp,
             Ok(resp) => {
