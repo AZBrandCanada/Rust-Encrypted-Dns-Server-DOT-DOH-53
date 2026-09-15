@@ -13,7 +13,7 @@ use cache::{
     create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache,
 };
 use dashmap::DashMap;
-use engine::AppState;
+use engine::{remaining_rrsig_validity, AppState};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
@@ -43,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
 
-    // Load persisted cache entries from disk (automatically discards expired/zombie entries)
+    // Point 22: Load persisted cache from disk. Any legacy entries lacking dnssec_status
+    // or exceeding allowable stale windows are automatically discarded.
     load_cache_from_disk(&cache, CACHE_FILE);
 
     let warm_limit: usize = std::env::var("WARM_LIMIT")
@@ -268,8 +269,10 @@ async fn bind_tcp(
 /// Pre-warms the cache with canonical, client-agnostic validated DNS responses.
 ///
 /// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
-/// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated, allowing
-/// `src/engine.rs` to dynamically construct appropriate client-tailored wire responses on demand.
+/// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated.
+///
+/// Point 21: Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
+/// validity period per RFC 4035 §5.3.3, matching the exact behavior of runtime resolution.
 async fn preload_domains(
     cache: DnsCache,
     recursor: Arc<RecursiveResolver>,
@@ -343,8 +346,16 @@ async fn preload_domains(
                             msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
 
                             if let Ok(wire) = msg.to_bytes() {
-                                let ttl = calculate_min_ttl(&msg);
+                                let mut ttl = calculate_min_ttl(&msg);
                                 let now = now_secs();
+
+                                // Point 21 / RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                                if status == dnssec::DnssecStatus::Secure {
+                                    if let Some(rrsig_ttl) = remaining_rrsig_validity(&msg, now) {
+                                        ttl = ttl.min(rrsig_ttl);
+                                    }
+                                }
+
                                 cache_ref.insert(
                                     cache_key,
                                     CacheEntry {

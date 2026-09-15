@@ -13,12 +13,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Active I/O timeout for completing an in-progress frame read/write.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum UDP datagram size (65,535 bytes).
-/// Sizing the socket receive buffer to 64KB ensures the OS kernel never silently
-/// truncates oversized incoming datagrams to a smaller user-space buffer.
-const MAX_UDP_RECV_BUF: usize = 65535;
+/// Maximum theoretical UDP datagram payload size (65,535 bytes).
+///
+/// Point 19: By allocating a full 64 KB user-space buffer for `recv_from()`, the
+/// application guarantees the operating system kernel will never silently truncate
+/// an incoming datagram to fit into user-space.
+const MAX_UDP_USER_BUF: usize = 65535;
 
 /// RFC 6891 §6.2.3: Standard maximum allowable UDP query payload size.
+/// Any incoming UDP datagram exceeding this size is discarded to prevent amplification attacks.
 const MAX_UDP_QUERY_SIZE: usize = 4096;
 
 /// RFC 7766 §8: The 2-byte length field permits messages up to 65,535 bytes (64 KB).
@@ -35,9 +38,9 @@ pub async fn run_udp_listener(
     state: AppState,
     concurrency_limit: Arc<Semaphore>,
 ) {
-    // 64 KB receive buffer guarantees the OS will never partially deliver/truncate
-    // an incoming UDP datagram to fit into user-space.
-    let mut buf = vec![0u8; MAX_UDP_RECV_BUF];
+    // 64 KB user-space buffer passed to recv_from ensures the OS delivers the complete
+    // datagram without truncation (standard IPv4/IPv6 UDP payloads cannot exceed 65,527 bytes).
+    let mut buf = vec![0u8; MAX_UDP_USER_BUF];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, peer)) => {
@@ -46,8 +49,7 @@ pub async fn run_udp_listener(
                     continue;
                 }
 
-                // If a datagram exceeds standard DNS UDP limits, reject it rather
-                // than treating an oversized packet as valid.
+                // Point 20: Reject oversized datagrams rather than parsing them.
                 if len > MAX_UDP_QUERY_SIZE {
                     tracing::debug!(
                         len,

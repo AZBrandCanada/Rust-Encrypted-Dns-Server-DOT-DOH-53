@@ -197,6 +197,10 @@ fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
 }
 
 /// Merges an alias redirection hop into the target response.
+///
+/// Point 15: Preserves the final result's RCODE, answers, authority, and additionals,
+/// while also merging any DNSSEC-relevant material (NSEC, NSEC3, RRSIG, DNSKEY) from
+/// the first redirection hop so the DNSSEC validator can authenticate the entire chain.
 fn merge_redirection_response(
     orig_name: &Name,
     orig_type: RecordType,
@@ -221,6 +225,7 @@ fn merge_redirection_response(
     q.set_query_class(DNSClass::IN);
     final_response.add_query(q);
 
+    // 1. Answers: first-hop records (CNAME/DNAME + RRSIGs) followed by final target answers
     for r in first_hop_msg.answers() {
         final_response.add_answer(r.clone());
     }
@@ -231,14 +236,37 @@ fn merge_redirection_response(
         }
     }
 
+    // 2. Authority: final target authority records (SOA, NSEC/NSEC3), plus any
+    // DNSSEC proof records from the first hop (e.g. wildcard denial proofs)
     for r in final_msg.name_servers() {
         final_response.add_name_server(r.clone());
     }
 
-    for r in final_msg.additionals() {
-        final_response.add_additional(r.clone());
+    for r in first_hop_msg.name_servers() {
+        let is_dnssec = matches!(
+            r.record_type(),
+            RecordType::NSEC | RecordType::NSEC3 | RecordType::RRSIG
+        );
+        if is_dnssec && !final_response.name_servers().iter().any(|existing| existing == r) {
+            final_response.add_name_server(r.clone());
+        }
     }
 
+    // 3. Additionals: final additionals, plus any first-hop DNSSEC records (excluding OPT)
+    for r in final_msg.additionals() {
+        if r.record_type() != RecordType::OPT {
+            final_response.add_additional(r.clone());
+        }
+    }
+
+    for r in first_hop_msg.additionals() {
+        let is_dnssec = matches!(r.record_type(), RecordType::RRSIG | RecordType::DNSKEY);
+        if is_dnssec && !final_response.additionals().iter().any(|existing| existing == r) {
+            final_response.add_additional(r.clone());
+        }
+    }
+
+    // Preserve EDNS from final message
     if let Some(edns) = final_msg.extensions().as_ref() {
         final_response.set_edns(edns.clone());
     }
@@ -427,7 +455,7 @@ impl RecursiveResolver {
                         }
                     }
 
-                    // Fall through to classify as authoritative terminal response or referral.
+                    // Fall through: non-matching answer records must not terminate recursion
                 }
 
                 // 2. Authoritative terminal responses
@@ -440,7 +468,11 @@ impl RecursiveResolver {
                 });
 
                 if let Some(soa_zone) = authoritative_soa {
-                    if soa_zone.zone_of(name) || soa_zone == name {
+                    let is_soa_authoritative = soa_zone.zone_of(name)
+                        || soa_zone == name
+                        || (rtype == RecordType::DS && (name.zone_of(soa_zone) || soa_zone.zone_of(name)));
+
+                    if is_soa_authoritative {
                         return Ok(response);
                     }
                 }
@@ -450,13 +482,12 @@ impl RecursiveResolver {
                 }
 
                 // 3. Referral processing
+                // Point 17: Do not accept empty responses lacking an authoritative SOA or NS delegation
                 if response.name_servers().is_empty() {
-                    if response.authoritative() {
-                        return Ok(response);
-                    }
                     tracing::warn!(
                         name = %name,
-                        "[RECURSOR] Received non-authoritative response with no relevant answers and no delegation; invalid"
+                        authoritative = response.authoritative(),
+                        "[RECURSOR] Received response with no relevant answers, no authoritative SOA, and no delegation; invalid"
                     );
                     return Err(RecursorError::NoProgress);
                 }
@@ -609,7 +640,6 @@ impl RecursiveResolver {
                 bailiwick = active_delegation.clone();
                 last_zone = Some(active_delegation);
 
-                next_ips.shuffle(&mut rand::thread_rng());
                 current_servers = next_ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect();
             }
 
@@ -651,8 +681,7 @@ impl RecursiveResolver {
             return None;
         }
 
-        // Shuffle within address families, but place IPv4 first to guarantee
-        // reliability on systems without working IPv6 routes.
+        // Shuffle within address families, prioritizing IPv4.
         let mut v4: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv4()).cloned().collect();
         let mut v6: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv6()).cloned().collect();
         {

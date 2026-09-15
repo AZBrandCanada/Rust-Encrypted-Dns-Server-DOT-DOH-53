@@ -1,4 +1,4 @@
-use crate::cache::{now_secs, CacheEntry, CacheFreshness, DnsCache};
+use crate::cache::{now_secs, CacheEntry, CacheFreshness, DnsCache, STALE_SERVE_TTL};
 use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::ratelimit::{RateLimiter, RrlAction};
 use crate::recursor::{calculate_min_ttl, RecursiveResolver};
@@ -65,6 +65,31 @@ fn is_dnssec_record(rtype: RecordType) -> bool {
     )
 }
 
+/// RFC 4035 §5.3.3: Binds the cached TTL of a Secure RRset to the remaining validity
+/// period of its participating RRSIGs using RFC 1982 serial number arithmetic.
+pub fn remaining_rrsig_validity(msg: &Message, now: u64) -> Option<u32> {
+    let now32 = (now & 0xFFFF_FFFF) as u32;
+    let mut min_remaining = u32::MAX;
+
+    for r in msg.answers().iter().chain(msg.name_servers().iter()) {
+        if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
+            let exp = sig.sig_expiration().get();
+            let diff = exp.wrapping_sub(now32) as i32;
+            if diff > 0 {
+                min_remaining = min_remaining.min(diff as u32);
+            } else {
+                return Some(0); // Signature has already expired
+            }
+        }
+    }
+
+    if min_remaining == u32::MAX {
+        None
+    } else {
+        Some(min_remaining)
+    }
+}
+
 /// Constructs a client-tailored DNS response from a canonical validated message.
 ///
 /// Implements the unified response construction pipeline:
@@ -72,11 +97,11 @@ fn is_dnssec_record(rtype: RecordType) -> bool {
 /// 2. Sets authoritative=false and recursion_available=true.
 /// 3. Computes the AD bit strictly per RFC 4035 §3.2.2/§3.2.3, RFC 6840 §5.7/§5.8, and RFC 8767 §6:
 ///    - Requires DnssecStatus::Secure.
-///    - Requires fresh data (stale cache hits MUST NOT set AD).
-///    - Requires unexpired signatures.
+///    - Requires fresh data (stale cache hits strictly set AD=0).
 ///    - Requires client signaling interest via DO=1 or request AD=1.
 ///    - Requires Checking Disabled to be clear (CD=0).
 /// 4. Decrements all Resource Record TTLs according to elapsed age (RFC 2181), skipping OPT.
+///    Applies RFC 8767 §4 positive 30s TTL when serving stale records.
 /// 5. Filters DNSSEC records (RRSIG, NSEC, NSEC3) if client DO=0 (RFC 4035 §3.2.1),
 ///    unless the client explicitly queried for that specific record type.
 /// 6. Adds or suppresses the EDNS0 OPT record depending on whether the client sent EDNS.
@@ -109,47 +134,25 @@ fn construct_client_response(
         client_resp.add_query(q.clone());
     }
 
-    // 2. AD bit determination
-    // Check if any RRSIG in the response has surpassed its cryptographic expiration
-    let any_rrsig_expired = base_msg
-        .answers()
-        .iter()
-        .chain(base_msg.name_servers().iter())
-        .any(|r| {
-            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
-                (sig.sig_expiration().get() as u64) < now
-            } else {
-                false
-            }
-        });
-
-    // RFC 6840 §5.7 & §5.8: The client signals interest in AD either via EDNS DO=1
-    // or by setting the AD bit in the request header. If neither was set, AD MUST NOT be set.
+    // 2. AD bit determination (RFC 4035 §3.2.2/3, RFC 6840 §5.7/8, RFC 8767 §6)
     let client_wants_ad = client_dnssec_ok || req_msg.authentic_data();
-
-    // RFC 4035 §3.2.2: A query with CD=1 indicates checking disabled; the resolver
-    // MUST NOT assert AD=1 in the response.
     let client_cd = req_msg.checking_disabled();
 
-    // RFC 4035 §3.2.3 / RFC 6840 §5.7 & §5.8: AD set iff fully validated Secure,
-    // client asked/signaled interest, CD is clear, and signatures are current.
-    // RFC 8767 §6: Responses served from stale cache MUST NOT set AD.
     let ad = dnssec_status == DnssecStatus::Secure
         && freshness == CacheFreshness::Fresh
-        && !any_rrsig_expired
         && client_wants_ad
         && !client_cd;
 
     client_resp.set_authentic_data(ad);
 
-// 3. TTL aging and DO=0 presentation filtering
+    // 3. TTL aging and DO=0 presentation filtering
     let age = now.saturating_sub(cached_at) as u32;
 
     // RFC 8767 §4: Fresh data gets aged TTL; stale data gets a positive 30-second TTL.
     let compute_ttl = |orig_ttl: u32| -> u32 {
         match freshness {
             CacheFreshness::Fresh => orig_ttl.saturating_sub(age),
-            CacheFreshness::Stale => crate::cache::STALE_SERVE_TTL,
+            CacheFreshness::Stale => STALE_SERVE_TTL,
             CacheFreshness::Expired => 0,
         }
     };
@@ -186,8 +189,8 @@ fn construct_client_response(
         rec.set_ttl(compute_ttl(rec.ttl()));
         client_resp.add_additional(rec);
     }
+
     // 4. EDNS0 (OPT) handling (RFC 6891 §6.1.1)
-    // Only return an OPT record if the client sent an OPT record in the request
     if req_msg.extensions().is_some() {
         let mut edns = Edns::new();
         edns.set_max_payload(client_max_payload as u16);
@@ -213,8 +216,7 @@ pub async fn process_dns_query(
         Err(_) => return ProcessOutcome::Malformed,
     };
 
-    // RFC 1035 §4.1.2 & RFC 8906 §3.2: Standard DNS requires exactly one question.
-    // If the request contains 0 or more than 1 question, reject as Malformed.
+    // RFC 1035 §4.1.2 & RFC 8906 §3.2: Reject messages not containing exactly one query.
     if req_msg.queries().len() != 1 {
         tracing::debug!(
             protocol,
@@ -317,8 +319,16 @@ pub async fn process_dns_query(
                                 fresh_msg.set_authoritative(false);
                                 fresh_msg.set_recursion_available(true);
                                 if let Ok(wire) = fresh_msg.to_bytes() {
-                                    let ttl = calculate_min_ttl(&fresh_msg);
+                                    let mut ttl = calculate_min_ttl(&fresh_msg);
                                     let cur_time = now_secs();
+
+                                    // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                                    if status == DnssecStatus::Secure {
+                                        if let Some(rrsig_ttl) = remaining_rrsig_validity(&fresh_msg, cur_time) {
+                                            ttl = ttl.min(rrsig_ttl);
+                                        }
+                                    }
+
                                     cache_clone.insert(
                                         key_clone.clone(),
                                         CacheEntry {
@@ -343,7 +353,6 @@ pub async fn process_dns_query(
 
             let mut decoder = BinDecoder::new(&entry.raw_wire);
             if let Ok(cached_msg) = Message::read(&mut decoder) {
-                // Retrieve DNSSEC validation state directly from the cache entry (Point 3)
                 let cached_status = entry.dnssec_status;
 
                 if let Some(wire) = construct_client_response(
@@ -419,14 +428,21 @@ pub async fn process_dns_query(
                 _ => {}
             }
 
-            // Persist the canonical response into cache if cacheable
             resp_msg.set_authentic_data(dnssec_status == DnssecStatus::Secure);
             resp_msg.set_authoritative(false);
             resp_msg.set_recursion_available(true);
 
             if is_cacheable(&resp_msg) && is_cacheable_dnssec(dnssec_status) {
                 if let Ok(canonical_wire) = resp_msg.to_bytes() {
-                    let ttl = calculate_min_ttl(&resp_msg);
+                    let mut ttl = calculate_min_ttl(&resp_msg);
+
+                    // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                    if dnssec_status == DnssecStatus::Secure {
+                        if let Some(rrsig_ttl) = remaining_rrsig_validity(&resp_msg, now) {
+                            ttl = ttl.min(rrsig_ttl);
+                        }
+                    }
+
                     state.cache.insert(
                         cache_key,
                         CacheEntry {
@@ -473,6 +489,7 @@ pub async fn process_dns_query(
                 "[RESOLVED] Resolution completed"
             );
 
+            // Verify payload size after complete client tailoring
             if state.rate_limiter.should_challenge_large_response(
                 protocol,
                 client_ip,

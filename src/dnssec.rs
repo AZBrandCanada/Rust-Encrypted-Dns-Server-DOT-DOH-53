@@ -511,6 +511,19 @@ impl DnssecValidator {
 
         let authority: Vec<Record> = msg.name_servers().to_vec();
 
+        // RFC 4035 §5.4: An authenticated negative response in a signed zone MUST include
+        // an authenticated SOA RRset. Verify that the SOA in authority is validly signed by the zone keys.
+        if let Some(soa_rec) = soa {
+            if !Self::verify_negative_rrset(soa_rec, &authority, &keys, budget) {
+                tracing::warn!(
+                    zone = %zone,
+                    qname = %qname,
+                    "[DNSSEC] Negative response SOA signature did not verify; Bogus"
+                );
+                return DnssecStatus::Bogus;
+            }
+        }
+
         let has_nsec3 = authority
             .iter()
             .any(|r| r.record_type() == RecordType::NSEC3);
@@ -759,6 +772,8 @@ impl DnssecValidator {
                 }
             }
 
+            let mut parent_ds_ttl = 300u32;
+
             let trusted_ds: Vec<(u16, u8, u8, Vec<u8>)> = if zone.is_root() {
                 ROOT_TRUST_ANCHORS
                     .iter()
@@ -789,6 +804,9 @@ impl DnssecValidator {
                         return ChainResult::Bogus;
                     }
                 };
+
+                let ds_ttl = calculate_min_ttl(&ds_msg);
+                parent_ds_ttl = ds_ttl;
 
                 let ds_records: Vec<DS> = ds_msg
                     .answers()
@@ -1001,8 +1019,16 @@ impl DnssecValidator {
                 return ChainResult::Bogus;
             }
 
-            let ttl = calculate_min_ttl(&dnskey_msg);
-            last_ttl = ttl;
+            let dnskey_ttl = calculate_min_ttl(&dnskey_msg);
+
+            // Points 9 & 10: The cached authenticated zone keys cannot safely outlive
+            // either the DNSKEY RRset itself OR the parent DS record that authenticated it.
+            let effective_ttl = if zone.is_root() {
+                dnskey_ttl
+            } else {
+                dnskey_ttl.min(parent_ds_ttl)
+            };
+            last_ttl = effective_ttl;
 
             // RFC 4035 §5.2: Authenticate all keys in the verified DNSKEY RRset
             // that possess the Zone Key flag (bit 7 = 1).
@@ -1015,7 +1041,7 @@ impl DnssecValidator {
                 zone_key,
                 CachedZoneKeys {
                     keys: authenticated_zone_keys.clone(),
-                    expires_at: now_secs() + ttl as u64,
+                    expires_at: now_secs() + effective_ttl as u64,
                 },
             );
 
