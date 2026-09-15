@@ -271,7 +271,7 @@ async fn bind_tcp(
 /// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
 /// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated.
 ///
-/// Point 21: Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
+/// Point 21 & 26: Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
 /// validity period per RFC 4035 §5.3.3, matching the exact behavior of runtime resolution.
 async fn preload_domains(
     cache: DnsCache,
@@ -349,7 +349,7 @@ async fn preload_domains(
                                 let mut ttl = calculate_min_ttl(&msg);
                                 let now = now_secs();
 
-                                // Point 21 / RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                                // Point 21 & 26 / RFC 4035 §5.3.3: Bound TTL to remaining signature validity
                                 if status == dnssec::DnssecStatus::Secure {
                                     if let Some(rrsig_ttl) = remaining_rrsig_validity(&msg, now) {
                                         ttl = ttl.min(rrsig_ttl);

@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use hickory_proto::rr::{Name, RecordType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,8 +24,9 @@ struct Bucket {
 }
 
 struct DomainRateBucket {
-    count: AtomicI64,
-    last_seen_sec: AtomicI64,
+    /// Packed atomic state: upper 32 bits store `epoch_sec`, lower 32 bits store `count`.
+    /// Updating both together in a single CAS transaction guarantees atomic epoch transitions.
+    state: AtomicU64,
     penalized_until_sec: AtomicI64,
 }
 
@@ -114,7 +115,7 @@ impl RateLimiter {
             }
         }
 
-        // Atomically verify and consume a token; prevents tokens from going negative under contention
+        // Point 24: Atomically verify and consume a token; prevents tokens from going negative under contention
         let token_acquired = bucket.tokens.fetch_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -140,10 +141,12 @@ impl RateLimiter {
             return RrlAction::Allow;
         }
 
-        let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| DomainRateBucket {
-            count: AtomicI64::new(0),
-            last_seen_sec: AtomicI64::new(now_s),
-            penalized_until_sec: AtomicI64::new(0),
+        let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| {
+            let initial_state = ((now_s as u64) << 32) | 0u64;
+            DomainRateBucket {
+                state: AtomicU64::new(initial_state),
+                penalized_until_sec: AtomicI64::new(0),
+            }
         });
 
         let penalty = domain_entry.penalized_until_sec.load(Ordering::Acquire);
@@ -152,20 +155,24 @@ impl RateLimiter {
             return RrlAction::Drop;
         }
 
-        let last_seen = domain_entry.last_seen_sec.load(Ordering::Acquire);
-        if now_s > last_seen {
-            // Only the winning thread in a new second resets the count
-            if domain_entry
-                .last_seen_sec
-                .compare_exchange(last_seen, now_s, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                domain_entry.count.store(1, Ordering::Release);
-                return RrlAction::Allow;
-            }
-        }
+        // Point 25: Atomic epoch transition and query counting in a single hardware transaction.
+        // Upper 32 bits = epoch seconds, lower 32 bits = count.
+        let mut query_count = 1;
+        let _ = domain_entry.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |val| {
+            let curr_epoch = (val >> 32) as i64;
+            let curr_count = (val & 0xFFFF_FFFF) as i64;
 
-        let query_count = domain_entry.count.fetch_add(1, Ordering::AcqRel) + 1;
+            if now_s > curr_epoch {
+                // New second: atomically advance epoch to now_s and reset count to 1
+                query_count = 1;
+                Some(((now_s as u64) << 32) | 1u64)
+            } else {
+                // Same second: increment count
+                let new_count = (curr_count + 1).min(u32::MAX as i64);
+                query_count = new_count;
+                Some(((curr_epoch as u64) << 32) | (new_count as u64))
+            }
+        });
 
         if query_count == 1 {
             RrlAction::Allow
@@ -199,8 +206,11 @@ impl RateLimiter {
 
         self.subnet_buckets
             .retain(|_, b| b.last_seen_millis.load(Ordering::Relaxed) >= cutoff_ms);
-        self.rrl_buckets
-            .retain(|_, b| b.last_seen_sec.load(Ordering::Relaxed) >= cutoff_s);
+        self.rrl_buckets.retain(|_, b| {
+            let state = b.state.load(Ordering::Relaxed);
+            let last_seen_s = (state >> 32) as i64;
+            last_seen_s >= cutoff_s
+        });
     }
 
     pub fn tracked_subnets(&self) -> usize {

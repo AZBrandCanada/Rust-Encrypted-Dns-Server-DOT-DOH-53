@@ -15,13 +15,14 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum theoretical UDP datagram payload size (65,535 bytes).
 ///
-/// Point 19: By allocating a full 64 KB user-space buffer for `recv_from()`, the
-/// application guarantees the operating system kernel will never silently truncate
-/// an incoming datagram to fit into user-space.
+/// Point 21: Uses a 65,535-byte application receive buffer so valid maximum-size
+/// UDP datagrams are not truncated by the application's `recv_from` buffer.
 const MAX_UDP_USER_BUF: usize = 65535;
 
-/// RFC 6891 §6.2.3: Standard maximum allowable UDP query payload size.
-/// Any incoming UDP datagram exceeding this size is discarded to prevent amplification attacks.
+/// Maximum accepted UDP query size enforced by this resolver: 4096 bytes.
+///
+/// Point 22: Enforcing an operational ceiling of 4096 bytes on inbound UDP queries
+/// mitigates payload-stuffing and buffer amplification abuse.
 const MAX_UDP_QUERY_SIZE: usize = 4096;
 
 /// RFC 7766 §8: The 2-byte length field permits messages up to 65,535 bytes (64 KB).
@@ -38,8 +39,7 @@ pub async fn run_udp_listener(
     state: AppState,
     concurrency_limit: Arc<Semaphore>,
 ) {
-    // 64 KB user-space buffer passed to recv_from ensures the OS delivers the complete
-    // datagram without truncation (standard IPv4/IPv6 UDP payloads cannot exceed 65,527 bytes).
+    // 64 KB application buffer prevents user-space truncation on recv_from
     let mut buf = vec![0u8; MAX_UDP_USER_BUF];
     loop {
         match socket.recv_from(&mut buf).await {
@@ -49,12 +49,12 @@ pub async fn run_udp_listener(
                     continue;
                 }
 
-                // Point 20: Reject oversized datagrams rather than parsing them.
+                // Point 22: Reject queries exceeding the resolver-enforced maximum UDP query size
                 if len > MAX_UDP_QUERY_SIZE {
                     tracing::debug!(
                         len,
                         client = %peer.ip(),
-                        "[UDP] Datagram exceeds maximum DNS UDP query size; dropping"
+                        "[UDP] Query exceeds resolver-enforced maximum UDP query size (4096 bytes); dropping"
                     );
                     continue;
                 }
@@ -158,7 +158,7 @@ pub async fn handle_length_prefixed_stream<S>(
         }
 
         // 2. Read the full DNS query payload with an active I/O timeout.
-        // Verify both timer completion and underlying I/O success.
+        // Verify both timer completion and underlying I/O success (Point 23).
         let mut req_buf = vec![0u8; req_len];
         let read_payload = timeout(IO_TIMEOUT, stream.read_exact(&mut req_buf)).await;
         if !matches!(read_payload, Ok(Ok(_))) {

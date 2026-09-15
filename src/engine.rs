@@ -135,6 +135,7 @@ fn construct_client_response(
     }
 
     // 2. AD bit determination (RFC 4035 §3.2.2/3, RFC 6840 §5.7/8, RFC 8767 §6)
+    // The response builder does not validate RRSIGs; it relies on DnssecStatus and freshness.
     let client_wants_ad = client_dnssec_ok || req_msg.authentic_data();
     let client_cd = req_msg.checking_disabled();
 
@@ -366,6 +367,7 @@ pub async fn process_dns_query(
                     client_dnssec_ok,
                     now,
                 ) {
+                    // Post-tailoring size check
                     if state.rate_limiter.should_challenge_large_response(
                         protocol,
                         client_ip,
@@ -489,7 +491,7 @@ pub async fn process_dns_query(
                 "[RESOLVED] Resolution completed"
             );
 
-            // Verify payload size after complete client tailoring
+            // Post-tailoring size check
             if state.rate_limiter.should_challenge_large_response(
                 protocol,
                 client_ip,

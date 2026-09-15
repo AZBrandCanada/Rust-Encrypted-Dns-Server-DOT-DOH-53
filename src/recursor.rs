@@ -266,7 +266,6 @@ fn merge_redirection_response(
         }
     }
 
-    // Preserve EDNS from final message
     if let Some(edns) = final_msg.extensions().as_ref() {
         final_response.set_edns(edns.clone());
     }
@@ -482,7 +481,7 @@ impl RecursiveResolver {
                 }
 
                 // 3. Referral processing
-                // Point 17: Do not accept empty responses lacking an authoritative SOA or NS delegation
+                // Point 16: An empty response lacking an authoritative SOA or NS delegation is invalid
                 if response.name_servers().is_empty() {
                     tracing::warn!(
                         name = %name,
@@ -670,8 +669,7 @@ impl RecursiveResolver {
     }
 
     /// Queries servers in concurrent batches of 3, prioritizing IPv4 to avoid
-    /// failing prematurely on networks without IPv6 routes. Walks through all candidates
-    /// until a valid answer is obtained.
+    /// failing prematurely on networks without IPv6 routes.
     async fn query_servers_with_fallback(
         servers: &[SocketAddr],
         name: &Name,
@@ -681,7 +679,6 @@ impl RecursiveResolver {
             return None;
         }
 
-        // Shuffle within address families, prioritizing IPv4.
         let mut v4: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv4()).cloned().collect();
         let mut v6: Vec<SocketAddr> = servers.iter().filter(|s| s.is_ipv6()).cloned().collect();
         {

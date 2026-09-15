@@ -511,7 +511,7 @@ impl DnssecValidator {
 
         let authority: Vec<Record> = msg.name_servers().to_vec();
 
-        // RFC 4035 §5.4: An authenticated negative response in a signed zone MUST include
+        // Point 11: RFC 4035 §5.4: An authenticated negative response in a signed zone MUST include
         // an authenticated SOA RRset. Verify that the SOA in authority is validly signed by the zone keys.
         if let Some(soa_rec) = soa {
             if !Self::verify_negative_rrset(soa_rec, &authority, &keys, budget) {
