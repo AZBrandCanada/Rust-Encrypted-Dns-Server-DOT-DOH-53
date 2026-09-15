@@ -506,7 +506,6 @@ impl DnssecValidator {
         DnssecStatus::Bogus
     }
 
-    /// Full RRset modeling: groups all records matching owner and type before signature verification
     fn verify_negative_rrset(
         rec: &Record,
         authority: &[Record],
@@ -673,7 +672,7 @@ impl DnssecValidator {
             return status;
         }
 
-// Find Closest Provable Encloser
+        // Find Closest Provable Encloser
         let mut closest = find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations);
 
         // RFC 5155 §8.4: For DS queries at an insecure delegation, the parent apex is already known
@@ -1521,6 +1520,7 @@ fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
     }
 }
 
+/// RFC 5155 §5: IH(salt, x, 0) = H(x | salt)
 fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     let mut wire = Vec::new();
     for label in name.iter() {
@@ -1530,9 +1530,9 @@ fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     }
     wire.push(0);
 
-    let mut data = salt.to_vec();
-    data.extend_from_slice(&wire);
-    let mut hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data)
+    // Name (wire) MUST come first, then salt
+    wire.extend_from_slice(salt);
+    let mut hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &wire)
         .as_ref()
         .to_vec();
 
