@@ -54,7 +54,7 @@ pub enum RecursorError {
     AllNameserversFailed,
     #[error("Failed to resolve nameserver glue IP")]
     GlueResolutionFailed,
-    #[error("Delegation made no forward progress")]
+    #[error("Delegation made no forward progress or loop detected")]
     NoProgress,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -73,20 +73,31 @@ pub struct RecursiveResolver {
     delegation_cache: DashMap<String, DelegationEntry>,
 }
 
-/// RFC 6672 DNAME suffix substitution: replace `dname_owner` suffix in `name` with `target`.
-pub fn dname_substitute(name: &Name, dname_owner: &Name, target: &Name) -> Option<Name> {
+/// RFC 6672 DNAME suffix substitution with strict length validation.
+pub fn dname_substitute(name: &Name, dname_owner: &Name, target: &Name) -> Result<Name, ResponseCode> {
     if !dname_owner.zone_of(name) || dname_owner == name {
-        return None;
+        return Err(ResponseCode::FormErr);
     }
     let name_str = name.to_string().to_lowercase();
     let owner_str = dname_owner.to_string().to_lowercase();
     if !name_str.ends_with(&owner_str) {
-        return None;
+        return Err(ResponseCode::FormErr);
     }
     let prefix = &name_str[..name_str.len() - owner_str.len()];
     let target_str = target.to_string();
     let new_name_str = format!("{}{}", prefix, target_str);
-    Name::from_str(&new_name_str).ok()
+
+    // RFC 6672 §2.2: Name length limit (255) and label length limit (63)
+    if new_name_str.len() > 255 {
+        return Err(ResponseCode::YXDomain);
+    }
+    for label in new_name_str.trim_end_matches('.').split('.') {
+        if label.len() > 63 {
+            return Err(ResponseCode::YXDomain);
+        }
+    }
+
+    Name::from_str(&new_name_str).map_err(|_| ResponseCode::YXDomain)
 }
 
 pub fn extract_dname_target(record: &Record) -> Option<Name> {
@@ -155,6 +166,58 @@ fn filter_safe_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     ips.into_iter().filter(|ip| is_safe_upstream_ip(*ip)).collect()
 }
 
+/// Merges an alias redirection hop into the target response.
+fn merge_redirection_response(
+    orig_name: &Name,
+    orig_type: RecordType,
+    first_hop_msg: &Message,
+    final_msg: Message,
+) -> Message {
+    let mut final_response = Message::new();
+    final_response.set_id(final_msg.id());
+    final_response.set_message_type(MessageType::Response);
+    final_response.set_op_code(final_msg.op_code());
+    final_response.set_authoritative(final_msg.authoritative());
+    final_response.set_truncated(final_msg.truncated());
+    final_response.set_recursion_desired(final_msg.recursion_desired());
+    final_response.set_recursion_available(final_msg.recursion_available());
+    final_response.set_authentic_data(final_msg.authentic_data());
+    final_response.set_checking_disabled(final_msg.checking_disabled());
+    final_response.set_response_code(final_msg.response_code());
+
+    let mut q = Query::new();
+    q.set_name(orig_name.clone());
+    q.set_query_type(orig_type);
+    q.set_query_class(DNSClass::IN);
+    final_response.add_query(q);
+
+    // Prepend redirection records from first hop (CNAME, DNAME, and RRSIGs)
+    for r in first_hop_msg.answers() {
+        final_response.add_answer(r.clone());
+    }
+
+    // Append answers from final target resolution
+    for r in final_msg.answers() {
+        final_response.add_answer(r.clone());
+    }
+
+    // Preserve authority section from final target response (critical for NXDOMAIN/NODATA proofs!)
+    for r in final_msg.name_servers() {
+        final_response.add_name_server(r.clone());
+    }
+
+    // Preserve additionals from final target response
+    for r in final_msg.additionals() {
+        final_response.add_additional(r.clone());
+    }
+
+    if let Some(edns) = final_msg.extensions().as_ref() {
+        final_response.set_edns(edns.clone());
+    }
+
+    final_response
+}
+
 impl RecursiveResolver {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -202,6 +265,11 @@ impl RecursiveResolver {
                         .iter()
                         .any(|r| r.name() == name && r.record_type() == rtype);
 
+                    if has_target_type {
+                        return Ok(response);
+                    }
+
+                    // A. Check for CNAME
                     let cname_target = response.answers().iter().find_map(|r| {
                         if r.name() == name && r.record_type() == RecordType::CNAME {
                             if let RData::CNAME(cname) = r.data() {
@@ -214,52 +282,73 @@ impl RecursiveResolver {
                         }
                     });
 
-                    let dname_redirect = response.answers().iter().find_map(|r| {
-                        if r.record_type() == DNAME_RECORD_TYPE && r.name().zone_of(name) && r.name() != name {
-                            let target = extract_dname_target(r)?;
-                            dname_substitute(name, r.name(), &target)
-                        } else {
-                            None
-                        }
-                    });
+                    if let Some(target) = cname_target {
+                        // Fast path: if the server already bundled the target answer, return it
+                        let target_in_answers = response
+                            .answers()
+                            .iter()
+                            .any(|r| r.name() == &target && r.record_type() == rtype);
 
-                    if has_target_type {
-                        return Ok(response);
-                    } else if let Some(target) = cname_target {
+                        if target_in_answers {
+                            return Ok(response);
+                        }
+
                         let key = format!("cname:{}", target.to_string().to_lowercase());
                         if visited.contains(&key) {
-                            return Ok(response);
+                            tracing::warn!(target = %target, "[RECURSOR] CNAME loop detected; aborting");
+                            return Err(RecursorError::NoProgress);
                         }
                         visited.insert(key);
 
-                        if let Ok(cname_resp) =
-                            self.resolve_internal(&target, rtype, depth + 1, visited).await
-                        {
-                            let mut merged = response.clone();
-                            for ans in cname_resp.answers() {
-                                merged.add_answer(ans.clone());
-                            }
-                            return Ok(merged);
-                        }
-                        return Ok(response);
-                    } else if let Some(substituted) = dname_redirect {
-                        let key = format!("dname:{}", substituted.to_string().to_lowercase());
-                        if visited.contains(&key) {
-                            return Ok(response);
-                        }
-                        visited.insert(key);
+                        let cname_resp = self
+                            .resolve_internal(&target, rtype, depth + 1, visited)
+                            .await?;
 
-                        if let Ok(dname_resp) =
-                            self.resolve_internal(&substituted, rtype, depth + 1, visited).await
-                        {
-                            let mut merged = response.clone();
-                            for ans in dname_resp.answers() {
-                                merged.add_answer(ans.clone());
-                            }
-                            return Ok(merged);
-                        }
-                        return Ok(response);
+                        return Ok(merge_redirection_response(name, rtype, &response, cname_resp));
                     }
+
+                    // B. Check for DNAME
+                    let dname_match = response.answers().iter().find_map(|r| {
+                        if r.record_type() == DNAME_RECORD_TYPE && r.name().zone_of(name) && r.name() != name {
+                            if let Some(target) = extract_dname_target(r) {
+                                return Some((r.name().clone(), target));
+                            }
+                        }
+                        None
+                    });
+
+                    if let Some((dname_owner, target)) = dname_match {
+                        match dname_substitute(name, &dname_owner, &target) {
+                            Ok(substituted) => {
+                                let key = format!("dname:{}", substituted.to_string().to_lowercase());
+                                if visited.contains(&key) {
+                                    tracing::warn!(target = %substituted, "[RECURSOR] DNAME loop detected; aborting");
+                                    return Err(RecursorError::NoProgress);
+                                }
+                                visited.insert(key);
+
+                                let dname_resp = self
+                                    .resolve_internal(&substituted, rtype, depth + 1, visited)
+                                    .await?;
+
+                                return Ok(merge_redirection_response(name, rtype, &response, dname_resp));
+                            }
+                            Err(ResponseCode::YXDomain) => {
+                                tracing::warn!(
+                                    name = %name,
+                                    dname = %dname_owner,
+                                    target = %target,
+                                    "[RECURSOR] DNAME synthesis resulted in oversized domain name; returning YXDOMAIN"
+                                );
+                                let mut yx_msg = response.clone();
+                                yx_msg.set_response_code(ResponseCode::YXDomain);
+                                return Ok(yx_msg);
+                            }
+                            Err(_) => return Err(RecursorError::NoProgress),
+                        }
+                    }
+
+                    return Ok(response);
                 }
 
                 // 2. Authoritative terminal responses
@@ -297,6 +386,7 @@ impl RecursiveResolver {
 
                 let delegation_owner = first_ns_rec.name().clone();
 
+                // Group and ensure coherent NS delegation owner across the referral
                 let mut ns_names = Vec::new();
                 for r in response.name_servers() {
                     if r.record_type() == RecordType::NS {
@@ -336,11 +426,31 @@ impl RecursiveResolver {
 
                 let active_delegation = delegation_owner;
 
+                // Extract glue from additionals.
+                // RFC 2181 §5.4.1: Glue is acceptable if it belongs to an advertised nameserver AND:
+                // 1. It is under bailiwick of the answering server (e.g. root or parent TLD), OR
+                // 2. It is under the delegated child zone itself.
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
                         continue;
                     }
+
+                    let is_in_bailiwick = bailiwick.is_root()
+                        || bailiwick.zone_of(add.name())
+                        || &bailiwick == add.name()
+                        || active_delegation.zone_of(add.name())
+                        || &active_delegation == add.name();
+
+                    if !is_in_bailiwick {
+                        tracing::debug!(
+                            ns = %add.name(),
+                            delegation = %active_delegation,
+                            "[SECURITY] Ignored out-of-bailiwick NS address in additionals (untrusted hint)"
+                        );
+                        continue;
+                    }
+
                     match add.data() {
                         RData::A(a) => next_ips.push(IpAddr::V4(a.0)),
                         RData::AAAA(a) => next_ips.push(IpAddr::V6(a.0)),
@@ -358,6 +468,7 @@ impl RecursiveResolver {
                     );
                 }
 
+                // If glue was omitted (or out-of-bailiwick), iteratively resolve nameserver IPs
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
@@ -465,8 +576,6 @@ impl RecursiveResolver {
 
         while let Some(joined) = set.join_next().await {
             if let Ok(Ok(msg)) = joined {
-                // Classify upstream responses: only accept NoError or NXDomain.
-                // Refused, ServFail, FormErr, and NotImp fail over to alternate servers.
                 match msg.response_code() {
                     ResponseCode::NoError | ResponseCode::NXDomain => {
                         return Some(msg);

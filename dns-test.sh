@@ -6,19 +6,19 @@
 #   bash, dig, curl, openssl, python3
 #
 # Targets:
-#   DNS UDP/TCP : 127.0.0.1
-#   DoH         : https://127.0.0.1/dns-query
-#   DoT         : 127.0.0.1:853
+#   DNS UDP/TCP : 217.154.156.210:53
+#   DoH         : https://doh-de.azbrand.ca/dns-query
+#   DoT         : doh-de.azbrand.ca:853
 #
 # Usage:
-#   chmod +x dns-test.sh
-#   ./dns-test.sh
+#   chmod +x azbrand-dns-test.sh
+#   ./azbrand-dns-test.sh
 #
 # Optional:
-#   ./dns-test.sh --skip-load
-#   ./dns-test.sh --skip-dot
-#   ./dns-test.sh --skip-doh
-#   ./dns-test.sh --skip-tcp
+#   ./azbrand-dns-test.sh --skip-load
+#   ./azbrand-dns-test.sh --skip-dot
+#   ./azbrand-dns-test.sh --skip-doh
+#   ./azbrand-dns-test.sh --skip-tcp
 #
 # IMPORTANT:
 # - This script does NOT attempt destructive packet injection or cache poisoning
@@ -32,10 +32,10 @@
 set -u
 set -o pipefail
 
-SERVER="${SERVER:-127.0.0.1}"
+SERVER="${SERVER:-217.154.156.210}"
 DNS_PORT="${DNS_PORT:-53}"
-DOH_URL="${DOH_URL:-https://127.0.0.1/dns-query}"
-DOT_HOST="${DOT_HOST:-127.0.0.1}"
+DOH_URL="${DOH_URL:-https://doh-de.azbrand.ca/dns-query}"
+DOT_HOST="${DOT_HOST:-doh-de.azbrand.ca}"
 DOT_PORT="${DOT_PORT:-853}"
 
 SKIP_LOAD=0
@@ -61,7 +61,7 @@ for arg in "$@"; do
 done
 
 STAMP="$(date '+%Y%m%d-%H%M%S')"
-OUTDIR="azbrand-dns-test-${STAMP}"
+OUTDIR="tests11/azbrand-dns-test-${STAMP}"
 mkdir -p "$OUTDIR"
 
 PASS=0

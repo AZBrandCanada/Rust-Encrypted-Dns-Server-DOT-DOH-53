@@ -1,4 +1,3 @@
-// src/ratelimit.rs
 use dashmap::DashMap;
 use hickory_proto::rr::{Name, RecordType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -10,8 +9,11 @@ const MAX_TRACKED_RRL_ENTRIES: usize = 65_536;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RrlAction {
+    /// Query is permitted to proceed normally.
     Allow,
+    /// Query is challenged with a valid DNS TC=1 response (forces client to prove source IP via TCP).
     Truncate,
+    /// Query is dropped silently to mitigate reflection/amplification.
     Drop,
 }
 
@@ -44,6 +46,7 @@ impl RateLimiter {
         })
     }
 
+    /// Aggregates IP addresses into /24 IPv4 subnets and /64 IPv6 prefixes.
     pub fn to_subnet(ip: IpAddr) -> IpAddr {
         match ip {
             IpAddr::V4(v4) => {
@@ -57,6 +60,12 @@ impl RateLimiter {
         }
     }
 
+    /// Evaluates rate-limiting policies for an incoming query.
+    ///
+    /// Preserves strict separation:
+    /// - All protocols use the subnet token bucket.
+    /// - UDP-specific duplicate-domain RRL and ANY-drops apply exclusively to UDP.
+    /// - TCP, DoT, and DoH never experience duplicate-domain penalties.
     pub fn check_query(
         &self,
         protocol: &str,
@@ -68,6 +77,7 @@ impl RateLimiter {
             return RrlAction::Allow;
         }
 
+        // RFC 8482: Instantly drop UDP ANY queries to neutralize high-volume amplification
         if protocol == "UDP" && qtype == RecordType::ANY {
             return RrlAction::Drop;
         }
@@ -84,33 +94,48 @@ impl RateLimiter {
 
         bucket.last_seen_millis.store(now_ms, Ordering::Relaxed);
 
+        // Thread-safe atomic token bucket refill
         let last_refill = bucket.last_refill_millis.load(Ordering::Relaxed);
         let elapsed_ms = (now_ms - last_refill).max(0);
         if elapsed_ms > 0 {
             let new_tokens = (elapsed_ms * self.refill_per_sec) / 1000;
             if new_tokens > 0 {
-                let current = bucket.tokens.load(Ordering::Relaxed);
-                let updated = (current + new_tokens).min(self.capacity);
-                bucket.tokens.store(updated, Ordering::Relaxed);
-                bucket.last_refill_millis.store(now_ms, Ordering::Relaxed);
+                if bucket
+                    .last_refill_millis
+                    .compare_exchange(last_refill, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let _ = bucket.tokens.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                        |curr| Some((curr + new_tokens).min(self.capacity)),
+                    );
+                }
             }
         }
 
+        // Check token availability
         let current_tokens = bucket.tokens.load(Ordering::Relaxed);
         if current_tokens <= 0 {
             return RrlAction::Drop;
         }
         bucket.tokens.fetch_sub(1, Ordering::Relaxed);
 
+        // TCP, DoT, and DoH only use the subnet token bucket
         if protocol != "UDP" {
             return RrlAction::Allow;
         }
 
-        if self.rrl_buckets.len() >= MAX_TRACKED_RRL_ENTRIES {
-            return RrlAction::Drop;
+        let rrl_key = format!("{}:{}:{}", subnet, qname.to_string().to_lowercase(), qtype);
+
+        // Mitigate table-exhaustion DoS: if table is full, do not blackhole the internet;
+        // fall back to allowing new queries through to the subnet token bucket.
+        if !self.rrl_buckets.contains_key(&rrl_key)
+            && self.rrl_buckets.len() >= MAX_TRACKED_RRL_ENTRIES
+        {
+            return RrlAction::Allow;
         }
 
-        let rrl_key = format!("{}:{}:{}", subnet, qname.to_string().to_lowercase(), qtype);
         let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| DomainRateBucket {
             count: AtomicI64::new(0),
             last_seen_sec: AtomicI64::new(now_s),
@@ -135,6 +160,7 @@ impl RateLimiter {
         if query_count == 1 {
             RrlAction::Allow
         } else if query_count == 2 {
+            // Force client to prove authentic IP via TCP handshake (mitigates IP spoofing)
             RrlAction::Truncate
         } else {
             domain_entry.penalized_until_sec.store(now_s + 3, Ordering::Relaxed);
@@ -142,6 +168,7 @@ impl RateLimiter {
         }
     }
 
+    /// Determines if an unauthenticated UDP response payload exceeds the client's advertised buffer.
     pub fn should_challenge_large_response(
         &self,
         protocol: &str,
@@ -155,6 +182,7 @@ impl RateLimiter {
         resp_bytes > client_max_payload
     }
 
+    /// Prunes stale buckets to bound memory usage.
     pub fn cleanup(&self, max_age: Duration) {
         let cutoff_ms = now_millis() - max_age.as_millis() as i64;
         let cutoff_s = cutoff_ms / 1000;

@@ -1,4 +1,3 @@
-// src/main.rs
 mod cache;
 mod dns;
 mod dnssec;
@@ -10,7 +9,9 @@ mod recursor;
 mod tls;
 mod tranco;
 
-use cache::{create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache};
+use cache::{
+    create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache,
+};
 use dashmap::DashMap;
 use engine::AppState;
 use hickory_proto::op::ResponseCode;
@@ -42,10 +43,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
 
+    // Load persisted cache entries from disk (automatically discards expired/zombie entries)
     load_cache_from_disk(&cache, CACHE_FILE);
 
-    let warm_limit: usize = std::env::var("WARM_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let concurrency: usize = std::env::var("WARM_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    let warm_limit: usize = std::env::var("WARM_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let concurrency: usize = std::env::var("WARM_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
 
     if warm_limit > 0 {
         tracing::info!(
@@ -74,8 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let rl_capacity: i64 = std::env::var("RATE_LIMIT_BURST").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-    let rl_per_sec: i64 = std::env::var("RATE_LIMIT_PER_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let rl_capacity: i64 = std::env::var("RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let rl_per_sec: i64 = std::env::var("RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
     let rate_limiter = ratelimit::RateLimiter::new(rl_capacity, rl_per_sec);
 
     // DNSSEC enforcement ON by default per RFC 4035 (set DNSSEC_ENFORCE=0 to disable)
@@ -96,7 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 rl_cleanup.cleanup(Duration::from_secs(900));
-                tracing::debug!(tracked_subnets = rl_cleanup.tracked_subnets(), "[RATELIMIT] Cleanup pass completed");
+                tracing::debug!(
+                    tracked_subnets = rl_cleanup.tracked_subnets(),
+                    "[RATELIMIT] Cleanup pass completed"
+                );
             }
         });
     }
@@ -110,9 +127,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let requested_dns_port: u16 = std::env::var("DNS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(53);
-    let requested_dot_port: u16 = std::env::var("DOT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(853);
-    let requested_doh_port: u16 = std::env::var("DOH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
+    let requested_dns_port: u16 = std::env::var("DNS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(53);
+    let requested_dot_port: u16 = std::env::var("DOT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(853);
+    let requested_doh_port: u16 = std::env::var("DOH_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(443);
     let doh_no_tls = std::env::var("DOH_NO_TLS").ok().as_deref() == Some("1");
 
     let udp_semaphore = Arc::new(Semaphore::new(2048));
@@ -123,12 +149,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp_socket = Arc::new(udp_socket);
     let udp_state = app_state.clone();
     let udp_sem = udp_semaphore.clone();
-    tokio::spawn(async move { dns::run_udp_listener(udp_socket, udp_state, udp_sem).await; });
+    tokio::spawn(async move {
+        dns::run_udp_listener(udp_socket, udp_state, udp_sem).await;
+    });
 
     let (tcp_listener, _) = bind_tcp(&host, active_dns_port, 5053).await?;
     let tcp_state = app_state.clone();
     let tcp_sem = tcp_semaphore.clone();
-    tokio::spawn(async move { dns::run_tcp_listener(tcp_listener, tcp_state, tcp_sem).await; });
+    tokio::spawn(async move {
+        dns::run_tcp_listener(tcp_listener, tcp_state, tcp_sem).await;
+    });
 
     let cert_path = std::env::var("CERT_PATH").unwrap_or_else(|_| "fullchain.pem".to_string());
     let key_path = std::env::var("KEY_PATH").unwrap_or_else(|_| "privkey.pem".to_string());
@@ -139,7 +169,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dot_listener, active_dot_port) = bind_tcp(&host, requested_dot_port, 8853).await?;
     let dot_state = app_state.clone();
     let dot_sem = dot_semaphore.clone();
-    tokio::spawn(async move { dot::run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await; });
+    tokio::spawn(async move {
+        dot::run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await;
+    });
 
     let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
     drop(doh_test_sock);
@@ -199,7 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn bind_udp(host: &str, preferred: u16, fallback: u16) -> Result<(UdpSocket, u16), std::io::Error> {
+async fn bind_udp(
+    host: &str,
+    preferred: u16,
+    fallback: u16,
+) -> Result<(UdpSocket, u16), std::io::Error> {
     let addr = format!("{}:{}", host, preferred);
     match UdpSocket::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
@@ -212,7 +248,11 @@ async fn bind_udp(host: &str, preferred: u16, fallback: u16) -> Result<(UdpSocke
     }
 }
 
-async fn bind_tcp(host: &str, preferred: u16, fallback: u16) -> Result<(TcpListener, u16), std::io::Error> {
+async fn bind_tcp(
+    host: &str,
+    preferred: u16,
+    fallback: u16,
+) -> Result<(TcpListener, u16), std::io::Error> {
     let addr = format!("{}:{}", host, preferred);
     match TcpListener::bind(&addr).await {
         Ok(s) => Ok((s, preferred)),
@@ -224,6 +264,12 @@ async fn bind_tcp(host: &str, preferred: u16, fallback: u16) -> Result<(TcpListe
         Err(e) => Err(e),
     }
 }
+
+/// Pre-warms the cache with canonical, client-agnostic validated DNS responses.
+///
+/// Stores canonical data under `{name}:{qtype}:IN` without fabricating client headers
+/// (ID, RD, CD, DO), allowing `src/engine.rs` to dynamically construct appropriate
+/// client-facing wire responses on demand.
 async fn preload_domains(
     cache: DnsCache,
     recursor: Arc<RecursiveResolver>,
@@ -253,18 +299,26 @@ async fn preload_domains(
 
         tokio::spawn(async move {
             let _permit = permit;
-            let fqdn = if domain.ends_with('.') { domain.clone() } else { format!("{}.", domain) };
+            let fqdn = if domain.ends_with('.') {
+                domain.clone()
+            } else {
+                format!("{}.", domain)
+            };
 
             if let Ok(name) = Name::from_str(&fqdn) {
                 for qtype in [RecordType::A, RecordType::AAAA] {
-                    let cache_key = format!("{}:{}:IN:do=0", name.to_ascii().to_lowercase(), qtype);
+                    // Canonical, client-agnostic cache key matching src/engine.rs
+                    let cache_key = format!("{}:{}:IN", name.to_ascii().to_lowercase(), qtype);
                     if cache_ref.contains_key(&cache_key) {
                         continue;
                     }
 
                     if let Ok(mut msg) = recursor_ref.resolve(&name, qtype).await {
-                        if matches!(msg.response_code(), ResponseCode::NoError | ResponseCode::NXDomain) {
-                            // Validate DNSSEC (both positive answers and negative NODATA/NXDomain)
+                        if matches!(
+                            msg.response_code(),
+                            ResponseCode::NoError | ResponseCode::NXDomain
+                        ) {
+                            // Validate DNSSEC for the canonical response
                             let status = dnssec::DnssecValidator::validate_message(
                                 &recursor_ref,
                                 &msg,
@@ -273,17 +327,17 @@ async fn preload_domains(
                             )
                             .await;
 
-                            // 1. DO NOT cache Bogus records!
-                            if status == dnssec::DnssecStatus::Bogus {
+                            // Do NOT cache Bogus or transient InsecureUnknown states
+                            if status == dnssec::DnssecStatus::Bogus
+                                || status == dnssec::DnssecStatus::InsecureUnknown
+                            {
                                 continue;
                             }
 
-                            // 2. DO NOT cache InsecureUnknown records!
-                            if status == dnssec::DnssecStatus::InsecureUnknown {
-                                continue;
-                            }
-
-                            // 3. Mark AD flag if Secure
+                            // Neutralize client-specific flags on the canonical cached response
+                            msg.set_id(0);
+                            msg.set_authoritative(false);
+                            msg.set_recursion_available(true);
                             msg.set_authentic_data(status == dnssec::DnssecStatus::Secure);
 
                             if let Ok(wire) = msg.to_bytes() {

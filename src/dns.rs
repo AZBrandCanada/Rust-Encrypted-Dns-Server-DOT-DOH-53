@@ -1,5 +1,5 @@
-// src/dns.rs
-use crate::engine::{process_dns_wire, AppState};
+use crate::engine::{process_dns_query, AppState, ProcessOutcome};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -7,9 +7,21 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_DNS_MSG_SIZE: usize = 4096;
+/// RFC 7766 §6.2.3: Idle timeout waiting for subsequent queries on an open connection.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Active I/O timeout for completing an in-progress frame read/write.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// RFC 7766 §8: The 2-byte length field permits messages up to 65,535 bytes (64 KB).
+/// This is essential for post-quantum ML-DSA-44 and large DNSSEC key sets.
+const MAX_TCP_MSG_SIZE: usize = 65535;
+
+/// RFC 1035 §4.1.1: Minimum DNS message header size is 12 bytes.
+const MIN_DNS_MSG_SIZE: usize = 12;
+
+/// Spawns the UDP listener on port 53.
+/// Handles UDP datagrams without establishing persistent state.
 pub async fn run_udp_listener(
     socket: Arc<UdpSocket>,
     state: AppState,
@@ -19,6 +31,11 @@ pub async fn run_udp_listener(
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, peer)) => {
+                // Reject undersized datagrams without processing
+                if len < MIN_DNS_MSG_SIZE {
+                    continue;
+                }
+
                 let req_wire = buf[..len].to_vec();
                 let socket_ref = socket.clone();
                 let state_ref = state.clone();
@@ -26,9 +43,19 @@ pub async fn run_udp_listener(
                 if let Ok(permit) = concurrency_limit.clone().try_acquire_owned() {
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let resp = process_dns_wire(&req_wire, &state_ref, "UDP", peer.ip()).await;
-                        if !resp.is_empty() {
-                            let _ = socket_ref.send_to(&resp, peer).await;
+                        let outcome =
+                            process_dns_query(&req_wire, &state_ref, "UDP", peer.ip()).await;
+
+                        match outcome {
+                            ProcessOutcome::Success(resp)
+                            | ProcessOutcome::ServFail(resp)
+                            | ProcessOutcome::Truncated(resp) => {
+                                let _ = socket_ref.send_to(&resp, peer).await;
+                            }
+                            ProcessOutcome::Dropped | ProcessOutcome::Malformed => {
+                                // Do not respond to malformed or rate-limited UDP packets
+                                // to eliminate reflection and amplification vectors.
+                            }
                         }
                     });
                 }
@@ -40,6 +67,7 @@ pub async fn run_udp_listener(
     }
 }
 
+/// Spawns the TCP listener on port 53.
 pub async fn run_tcp_listener(
     listener: TcpListener,
     state: AppState,
@@ -51,11 +79,19 @@ pub async fn run_tcp_listener(
                 let _ = stream.set_nodelay(true);
                 let state_ref = state.clone();
 
-                if let Ok(permit) = concurrency_limit.clone().try_acquire_owned() {
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        handle_length_prefixed_stream(stream, state_ref, "TCP", peer.ip()).await;
-                    });
+                match concurrency_limit.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            handle_length_prefixed_stream(stream, state_ref, "TCP", peer.ip()).await;
+                        });
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            client = %peer.ip(),
+                            "[TCP] Concurrency limit reached; dropping connection"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -65,44 +101,84 @@ pub async fn run_tcp_listener(
     }
 }
 
+/// Generic length-prefixed stream handler used by both plain TCP (port 53) and DoT (port 853).
+///
+/// Implements RFC 7766 connection reuse, pipelining, 16-bit framing, and idle disconnects.
 pub async fn handle_length_prefixed_stream<S>(
     mut stream: S,
     state: AppState,
     protocol: &'static str,
-    client_ip: std::net::IpAddr,
+    client_ip: IpAddr,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut len_buf = [0u8; 2];
     loop {
-        let read_len = timeout(IO_TIMEOUT, stream.read_exact(&mut len_buf)).await;
-        if read_len.is_err() || read_len.unwrap().is_err() {
+        // 1. Read the 2-byte big-endian message length prefix with an idle timeout
+        let read_len = timeout(IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let req_len = match read_len {
+            Ok(Ok(2)) => u16::from_be_bytes(len_buf) as usize,
+            _ => break, // Connection closed cleanly or idle timeout expired
+        };
+
+        // RFC 7766 §8: Validate framing length.
+        // Minimum DNS message is 12 bytes; maximum 16-bit frame size is 65,535 bytes.
+        if !(MIN_DNS_MSG_SIZE..=MAX_TCP_MSG_SIZE).contains(&req_len) {
+            tracing::debug!(
+                protocol,
+                client = %client_ip,
+                len = req_len,
+                "[{}] Invalid TCP frame length; closing stream",
+                protocol
+            );
             break;
         }
 
-        let req_len = u16::from_be_bytes(len_buf) as usize;
-        if req_len == 0 || req_len > MAX_DNS_MSG_SIZE {
-            break;
-        }
-
+        // 2. Read the full DNS query payload with an active I/O timeout
         let mut req_buf = vec![0u8; req_len];
         if timeout(IO_TIMEOUT, stream.read_exact(&mut req_buf)).await.is_err() {
             break;
         }
 
-        let resp_wire = process_dns_wire(&req_buf, &state, protocol, client_ip).await;
-        if resp_wire.is_empty() {
-            break;
-        }
+        // 3. Process the query through the unified engine
+        let outcome = process_dns_query(&req_buf, &state, protocol, client_ip).await;
 
-        let mut out = Vec::with_capacity(2 + resp_wire.len());
-        out.extend_from_slice(&(resp_wire.len() as u16).to_be_bytes());
-        out.extend_from_slice(&resp_wire);
+        match outcome {
+            ProcessOutcome::Success(resp_wire)
+            | ProcessOutcome::ServFail(resp_wire)
+            | ProcessOutcome::Truncated(resp_wire) => {
+                if resp_wire.len() > MAX_TCP_MSG_SIZE {
+                    tracing::error!(
+                        protocol,
+                        len = resp_wire.len(),
+                        "[{}] Response exceeds 64KB TCP frame limit",
+                        protocol
+                    );
+                    break;
+                }
 
-        if timeout(IO_TIMEOUT, stream.write_all(&out)).await.is_err()
-            || timeout(IO_TIMEOUT, stream.flush()).await.is_err()
-        {
-            break;
+                let len_bytes = (resp_wire.len() as u16).to_be_bytes();
+                let write_result = timeout(IO_TIMEOUT, async {
+                    stream.write_all(&len_bytes).await?;
+                    stream.write_all(&resp_wire).await?;
+                    stream.flush().await?;
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+
+                if write_result.is_err() {
+                    break;
+                }
+            }
+            ProcessOutcome::Dropped => {
+                // RFC 7766 §6.2.1: If a query is dropped by rate limiting,
+                // do NOT tear down the persistent connection; continue reading.
+                continue;
+            }
+            ProcessOutcome::Malformed => {
+                // Client transmitted an unparseable DNS wire buffer; close stream
+                break;
+            }
         }
     }
 }

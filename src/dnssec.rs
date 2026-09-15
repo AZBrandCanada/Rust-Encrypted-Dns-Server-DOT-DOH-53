@@ -1342,7 +1342,7 @@ fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChai
                 && r.name() != &current
             {
                 let target = extract_dname_target(r)?;
-                let sub = dname_substitute(&current, r.name(), &target)?;
+                let sub = dname_substitute(&current, r.name(), &target).ok()?;
                 return Some((r.name().clone(), target, sub));
             }
             None
