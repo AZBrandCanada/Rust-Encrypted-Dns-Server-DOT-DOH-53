@@ -11,14 +11,14 @@
 #   DoT         : 127.0.0.1:853
 #
 # Usage:
-#   chmod +x azbrand-dns-test.sh
-#   ./azbrand-dns-test.sh
+#   chmod +x dns-test.sh
+#   ./dns-test.sh
 #
 # Optional:
-#   ./azbrand-dns-test.sh --skip-load
-#   ./azbrand-dns-test.sh --skip-dot
-#   ./azbrand-dns-test.sh --skip-doh
-#   ./azbrand-dns-test.sh --skip-tcp
+#   ./dns-test.sh --skip-load
+#   ./dns-test.sh --skip-dot
+#   ./dns-test.sh --skip-doh
+#   ./dns-test.sh --skip-tcp
 #
 # IMPORTANT:
 # - This script does NOT attempt destructive packet injection or cache poisoning
