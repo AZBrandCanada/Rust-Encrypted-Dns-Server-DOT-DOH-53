@@ -1,3 +1,4 @@
+// src/dot.rs
 use crate::dns::handle_length_prefixed_stream;
 use crate::engine::AppState;
 use std::sync::Arc;

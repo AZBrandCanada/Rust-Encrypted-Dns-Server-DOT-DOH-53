@@ -1,3 +1,4 @@
+// src/engine.rs
 use crate::cache::{now_secs, CacheEntry, CacheFreshness, DnsCache, STALE_SERVE_TTL};
 use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::ratelimit::{RateLimiter, RrlAction};

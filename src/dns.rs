@@ -1,3 +1,4 @@
+// src/dns.rs
 use crate::engine::{process_dns_query, AppState, ProcessOutcome};
 use std::net::IpAddr;
 use std::sync::Arc;
