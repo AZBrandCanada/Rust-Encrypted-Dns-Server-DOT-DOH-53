@@ -1,6 +1,5 @@
 # Unified Recursive DNS Server
 
-**IN DEVELOPMENT**
 A high-performance, lightweight, multi-protocol recursive DNS resolver engineered in Rust. It serves plain DNS (UDP/TCP), DNS-over-TLS (DoT), and DNS-over-HTTPS (DoH) concurrently while performing independent, from-the-root iterative resolution without relying on upstream third-party resolvers (such as Google, Cloudflare, or Quad9).
 
 Built with production-grade security, comprehensive DNSSEC validation (including authenticated denial of existence, authenticated DS denial, RFC 6672 DNAME synthesis, and post-quantum ML-DSA-44), anti-amplification defenses, SSRF immunity, and a stale-while-revalidate caching engine.
