@@ -120,7 +120,7 @@ async fn download_and_extract(
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
 
     let mut domains = Vec::new();
-    if archive.len() > 0 {
+    if !archive.is_empty() {
         let mut file = archive.by_index(0)?;
         let reader = BufReader::new(&mut file);
         for line in reader.lines().map_while(Result::ok) {

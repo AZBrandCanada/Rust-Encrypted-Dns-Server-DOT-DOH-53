@@ -486,7 +486,7 @@ impl DnssecValidator {
             .answers()
             .iter()
             .filter(|r| r.record_type() == RecordType::CNAME)
-            .last()
+            .next_back()
             .and_then(|r| {
                 if let RData::CNAME(cname) = r.data() {
                     Some(cname.0.clone())
@@ -1599,7 +1599,7 @@ fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
 fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     let mut wire = Vec::new();
     for label in name.iter() {
-        let bytes: &[u8] = label.as_ref();
+        let bytes: &[u8] = label;
         wire.push(bytes.len() as u8);
         wire.extend_from_slice(&bytes.to_ascii_lowercase());
     }
@@ -1685,7 +1685,7 @@ fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<V
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

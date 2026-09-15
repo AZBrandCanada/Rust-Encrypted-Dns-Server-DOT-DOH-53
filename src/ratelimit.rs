@@ -148,7 +148,7 @@ impl RateLimiter {
         }
 
         let domain_entry = self.rrl_buckets.entry(rrl_key).or_insert_with(|| {
-            let initial_state = ((now_s as u64) << 32) | 0u64;
+            let initial_state = (now_s as u64) << 32;
             DomainRateBucket {
                 state: AtomicU64::new(initial_state),
                 penalized_until_sec: AtomicI64::new(0),

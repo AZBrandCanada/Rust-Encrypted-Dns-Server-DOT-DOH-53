@@ -286,71 +286,69 @@ pub async fn process_dns_query(
         // Do not serve Expired records; fall through to synchronous resolution
         if freshness != CacheFreshness::Expired {
             // Stale-While-Revalidate: serve stale while triggering background revalidation
-            if freshness == CacheFreshness::Stale {
-                if state.in_flight.insert(cache_key.clone(), ()).is_none() {
-                    let cache_clone = state.cache.clone();
-                    let recursor_clone = state.recursor.clone();
-                    let key_clone = cache_key.clone();
-                    let name_clone = qname.clone();
-                    let in_flight_clone = state.in_flight.clone();
+            if freshness == CacheFreshness::Stale
+                && state.in_flight.insert(cache_key.clone(), ()).is_none()
+            {
+                let cache_clone = state.cache.clone();
+                let recursor_clone = state.recursor.clone();
+                let key_clone = cache_key.clone();
+                let name_clone = qname.clone();
+                let in_flight_clone = state.in_flight.clone();
 
-                    tokio::spawn(async move {
-                        if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await
-                        {
-                            let status = DnssecValidator::validate_message(
-                                &recursor_clone,
-                                &fresh_msg,
-                                &name_clone,
-                                qtype,
-                            )
-                            .await;
+                tokio::spawn(async move {
+                    if let Ok(mut fresh_msg) = recursor_clone.resolve(&name_clone, qtype).await {
+                        let status = DnssecValidator::validate_message(
+                            &recursor_clone,
+                            &fresh_msg,
+                            &name_clone,
+                            qtype,
+                        )
+                        .await;
 
-                            match status {
-                                DnssecStatus::Secure => {
-                                    fresh_msg.set_authentic_data(true);
-                                }
-                                DnssecStatus::InsecureUnsigned | DnssecStatus::InsecureUnknown => {
-                                    fresh_msg.set_authentic_data(false);
-                                }
-                                DnssecStatus::Bogus => {
-                                    tracing::warn!(
-                                        domain = %name_clone,
-                                        rtype = %qtype,
-                                        "[DNSSEC] Bogus response during stale revalidation; keeping previous cache entry"
-                                    );
-                                    in_flight_clone.remove(&key_clone);
-                                    return;
-                                }
+                        match status {
+                            DnssecStatus::Secure => {
+                                fresh_msg.set_authentic_data(true);
                             }
-
-                            if is_cacheable(&fresh_msg) && is_cacheable_dnssec(status) {
-                                fresh_msg.set_authoritative(false);
-                                fresh_msg.set_recursion_available(true);
-                                if let Ok(wire) = fresh_msg.to_bytes() {
-                                    let cur_time = now_secs();
-                                    // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
-                                    let ttl = calculate_cache_ttl(&fresh_msg, status, cur_time);
-
-                                    cache_clone.insert(
-                                        key_clone.clone(),
-                                        CacheEntry {
-                                            raw_wire: wire,
-                                            min_ttl: ttl,
-                                            cached_at: cur_time,
-                                            last_revalidated_at: cur_time,
-                                            dnssec_status: status,
-                                        },
-                                    );
-                                }
-                            } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
-                                existing.last_revalidated_at = now_secs();
+                            DnssecStatus::InsecureUnsigned | DnssecStatus::InsecureUnknown => {
+                                fresh_msg.set_authentic_data(false);
+                            }
+                            DnssecStatus::Bogus => {
+                                tracing::warn!(
+                                    domain = %name_clone,
+                                    rtype = %qtype,
+                                    "[DNSSEC] Bogus response during stale revalidation; keeping previous cache entry"
+                                );
+                                in_flight_clone.remove(&key_clone);
+                                return;
                             }
                         }
-                        in_flight_clone.remove(&key_clone);
-                    });
-                }
-            }
 
+                        if is_cacheable(&fresh_msg) && is_cacheable_dnssec(status) {
+                            fresh_msg.set_authoritative(false);
+                            fresh_msg.set_recursion_available(true);
+                            if let Ok(wire) = fresh_msg.to_bytes() {
+                                let cur_time = now_secs();
+                                // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
+                                let ttl = calculate_cache_ttl(&fresh_msg, status, cur_time);
+
+                                cache_clone.insert(
+                                    key_clone.clone(),
+                                    CacheEntry {
+                                        raw_wire: wire,
+                                        min_ttl: ttl,
+                                        cached_at: cur_time,
+                                        last_revalidated_at: cur_time,
+                                        dnssec_status: status,
+                                    },
+                                );
+                            }
+                        } else if let Some(mut existing) = cache_clone.get_mut(&key_clone) {
+                            existing.last_revalidated_at = now_secs();
+                        }
+                    }
+                    in_flight_clone.remove(&key_clone);
+                });
+            }
             let mut decoder = BinDecoder::new(&entry.raw_wire);
             if let Ok(cached_msg) = Message::read(&mut decoder) {
                 let cached_status = entry.dnssec_status;

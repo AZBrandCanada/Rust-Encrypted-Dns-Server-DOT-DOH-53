@@ -378,7 +378,7 @@ async fn preload_domains(
             }
 
             let done = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 50 == 0 || done == total_domains {
+            if done.is_multiple_of(50) || done == total_domains {
                 tracing::info!(
                     progress = format!("{}/{}", done, total_domains),
                     records_cached = warmed_ref.load(Ordering::Relaxed),
