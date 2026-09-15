@@ -8,7 +8,7 @@ use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, Nsec3HashAlgorithm, PublicKey};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use ml_dsa::signature::Verifier;
 use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
@@ -155,7 +155,6 @@ impl DnssecValidator {
         }
     }
 
-    /// Validate the answer section of a positive response, including CNAME and DNAME hops.
     pub async fn validate_answer(
         recursor: &RecursiveResolver,
         name: &Name,
@@ -211,7 +210,6 @@ impl DnssecValidator {
                     input_name,
                     ..
                 } => {
-                    // RFC 6672 §3.3: DNAME RRset validation
                     let dname_records: Vec<Record> = all_records
                         .iter()
                         .filter(|r| r.name() == dname_owner && r.record_type() == DNAME_RECORD_TYPE)
@@ -236,7 +234,6 @@ impl DnssecValidator {
                         other => return other,
                     }
 
-                    // Validate synthesized CNAME if present
                     let synth_cname_records: Vec<Record> = all_records
                         .iter()
                         .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
@@ -288,7 +285,6 @@ impl DnssecValidator {
         Self::validate_rrset(recursor, &final_owner, rtype, &target_records, all_records, budget).await
     }
 
-    /// Validate a single RRset.
     async fn validate_rrset(
         recursor: &RecursiveResolver,
         owner: &Name,
@@ -555,7 +551,6 @@ impl DnssecValidator {
         false
     }
 
-    /// Decomposed RFC 4035 §5.4 NSEC validation
     fn validate_nsec(
         keys: &[DNSKEY],
         qname: &Name,
@@ -582,23 +577,19 @@ impl DnssecValidator {
             }
         }
 
-        // Proof Type 1: Name Exists — NODATA
         if let Some(status) = check_nsec_nodata(qname, qtype, &nsec_records) {
             return status;
         }
 
-        // Find Closest Encloser
         let closest = match find_nsec_closest_encloser(qname, &nsec_records) {
             Some(c) => c,
             None => return DnssecStatus::Bogus,
         };
 
-        // Proof Type 2: Wildcard NODATA
         if let Some(status) = check_nsec_wildcard_nodata(qname, qtype, &closest, &nsec_records) {
             return status;
         }
 
-        // Proof Type 3: Direct NXDOMAIN
         if let Some(status) = check_nsec_nxdomain(qname, &closest, &nsec_records) {
             return status;
         }
@@ -606,7 +597,6 @@ impl DnssecValidator {
         DnssecStatus::Bogus
     }
 
-    /// Decomposed RFC 5155 §8 NSEC3 validation
     fn validate_nsec3(
         keys: &[DNSKEY],
         qname: &Name,
@@ -668,12 +658,10 @@ impl DnssecValidator {
             }
         }
 
-        // Proof Type 1: Name Exists — NODATA
         if let Some(status) = check_nsec3_nodata(qname, qtype, &nsec3_records, &salt, iterations) {
             return status;
         }
 
-        // Find Closest Provable Encloser
         let closest = match find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations) {
             Some(c) => c,
             None => return DnssecStatus::Bogus,
@@ -683,12 +671,10 @@ impl DnssecValidator {
             return DnssecStatus::Bogus;
         }
 
-        // Proof Type 2: Wildcard NODATA
         if let Some(status) = check_nsec3_wildcard_nodata(&closest, qtype, &nsec3_records, &salt, iterations) {
             return status;
         }
 
-        // Proof Type 3: Direct NXDOMAIN (including Opt-Out evaluation)
         if let Some(status) = check_nsec3_nxdomain(qname, &closest, qtype, &nsec3_records, &salt, iterations) {
             return status;
         }
@@ -766,7 +752,6 @@ impl DnssecValidator {
                     })
                     .collect();
 
-                // Authenticated denial of DS nonexistence
                 if ds_records.is_empty() {
                     let authority = ds_msg.name_servers();
                     let denial_status = if authority.iter().any(|r| r.record_type() == RecordType::NSEC3) {
@@ -1301,7 +1286,6 @@ fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChai
             return RedirectionChainResult::TooLong;
         }
 
-        // 1. Direct CNAME check
         let cname_target = records.iter().find_map(|r| {
             if r.name() == &current && r.record_type() == RecordType::CNAME {
                 if let RData::CNAME(c) = r.data() {
@@ -1320,7 +1304,6 @@ fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChai
             continue;
         }
 
-        // 2. Matching DNAME check
         let dname_step = records.iter().find_map(|r| {
             if r.record_type() == DNAME_RECORD_TYPE
                 && r.name().zone_of(&current)
@@ -1468,10 +1451,14 @@ fn wildcard_name(closest: &Name) -> Name {
 }
 
 fn nsec_covers(owner: &Name, next: &Name, target: &Name) -> bool {
-    if owner < next {
-        owner < target && target < next
+    let o = owner.to_lowercase();
+    let n = next.to_lowercase();
+    let t = target.to_lowercase();
+
+    if o < n {
+        o < t && t < n
     } else {
-        owner < target || target < next
+        o < t || t < n
     }
 }
 
@@ -1628,23 +1615,36 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
     out.extend_from_slice(&rrsig.sig_inception().get().to_be_bytes());
     out.extend_from_slice(&rrsig.key_tag().to_be_bytes());
 
+    // RFC 4034 §3.1.8.1: Signer name MUST be canonical lowercase in wire format
     {
         let mut name_buf = Vec::new();
         let mut encoder = BinEncoder::new(&mut name_buf);
         encoder.set_canonical_names(true);
-        rrsig.signer_name().emit(&mut encoder).ok()?;
+        let canonical_signer = rrsig.signer_name().to_lowercase();
+        canonical_signer.emit(&mut encoder).ok()?;
         out.extend_from_slice(&name_buf);
     }
 
+    // RFC 4034 §3.1.3: rrsig.num_labels() excludes the root label.
+    // Hickory's owner.num_labels() includes the root label.
     let sig_labels = rrsig.num_labels() as usize;
-    let owner_labels = owner.num_labels() as usize;
+    let actual_owner_labels = if owner.is_root() {
+        0
+    } else {
+        (owner.num_labels().saturating_sub(1)) as usize
+    };
 
-    let canonical_owner = if owner_labels > sig_labels {
-        let base = owner.trim_to(sig_labels);
+    let canonical_owner_raw = if actual_owner_labels > sig_labels {
+        // Legitimate wildcard expansion (RFC 4035 §5.3.4):
+        // Retain rightmost sig_labels and prepend "*."
+        let base = owner.trim_to(sig_labels + 1); // +1 because trim_to in Hickory includes root
         Name::from_str(&format!("*.{}", base)).unwrap_or_else(|_| owner.clone())
     } else {
         owner.clone()
     };
+
+    // RFC 4034 §6.2: Owner name MUST be canonical lowercase
+    let canonical_owner = canonical_owner_raw.to_lowercase();
 
     struct CanonicalEntry {
         rdata_bytes: Vec<u8>,
@@ -1687,7 +1687,6 @@ fn build_tbs(rrsig: &RRSIG, owner: &Name, records: &[Record]) -> Option<Vec<u8>>
 
     Some(out)
 }
-
 fn verify_signature(algorithm: Algorithm, pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
     match algorithm {
         Algorithm::RSASHA256 | Algorithm::RSASHA512 => {
