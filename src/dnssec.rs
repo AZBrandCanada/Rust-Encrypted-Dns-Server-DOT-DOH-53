@@ -673,7 +673,17 @@ impl DnssecValidator {
             return status;
         }
 
-        let closest = match find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations) {
+// Find Closest Provable Encloser
+        let mut closest = find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations);
+
+        // RFC 5155 §8.4: For DS queries at an insecure delegation, the parent apex is already known
+        // to exist. If the parent authority omitted the apex NSEC3 record and only provided the
+        // covering Opt-Out NSEC3 record, the closest encloser is the parent apex (qname.base_name()).
+        if closest.is_none() && qtype == RecordType::DS {
+            closest = Some(qname.base_name());
+        }
+
+        let closest = match closest {
             Some(c) => c,
             None => return DnssecStatus::Bogus,
         };
