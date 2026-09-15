@@ -103,19 +103,14 @@ impl RateLimiter {
             if new_tokens > 0
                 && bucket
                     .last_refill_millis
-                    .compare_exchange(
-                        last_refill,
-                        now_ms,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(last_refill, now_ms, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                let _ = bucket.tokens.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                    |curr| Some((curr + new_tokens).min(self.capacity)),
-                );
+                let _ = bucket
+                    .tokens
+                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
+                        Some((curr + new_tokens).min(self.capacity))
+                    });
             }
         }
 

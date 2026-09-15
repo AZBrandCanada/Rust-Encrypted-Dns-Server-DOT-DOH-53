@@ -35,7 +35,6 @@ pub enum ProcessOutcome {
     Malformed,
 }
 
-
 fn is_cacheable(msg: &Message) -> bool {
     matches!(
         msg.response_code(),
@@ -496,8 +495,6 @@ pub async fn process_dns_query(
         }
     }
 }
-
-
 
 pub fn make_truncated_wire(id: u16, query: Option<&hickory_proto::op::Query>) -> Vec<u8> {
     let mut msg = Message::new();

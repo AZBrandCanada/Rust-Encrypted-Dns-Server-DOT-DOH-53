@@ -29,7 +29,7 @@ pub fn load_or_generate(
         return Ok(LoadedCert {
             certs,
             key,
-  
+
             cert_file: cert_path.to_string(),
             key_file: key_path.to_string(),
         });
