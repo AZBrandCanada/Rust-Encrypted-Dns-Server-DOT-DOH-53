@@ -1,5 +1,5 @@
 use crate::cache::now_secs;
-use crate::recursor::{calculate_min_ttl, RecursiveResolver};
+use crate::recursor::{calculate_min_ttl, dname_substitute, RecursiveResolver};
 use dashmap::DashMap;
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
 use hickory_proto::dnssec::{Algorithm, Nsec3HashAlgorithm, PublicKey};
@@ -22,23 +22,16 @@ const GLOBAL_MAX_SIG_CHECKS: usize = 24;      // Global budget against KeyTrap (
 const MAX_NEGATIVE_RECORDS: usize = 8;        // Cap NSEC/NSEC3 records processed
 const MAX_NSEC3_ITERATIONS: u16 = 150;        // RFC 9276 recommendation
 const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16; // Bounded walk
-const MAX_CNAME_CHAIN: usize = 16;            // Bounded CNAME chain walk
+const MAX_CNAME_CHAIN: usize = 16;            // Bounded CNAME/DNAME chain walk
 
-/// DNSSEC verdict for a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
-    /// Cryptographically validated end-to-end.
     Secure,
-    /// Zone positively proven unsigned via authenticated denial of DS.
     InsecureUnsigned,
-    /// Signedness could not be determined (transient chain-build failure).
-    /// Served with AD=0 but MUST NOT be cached.
     InsecureUnknown,
-    /// Signed zone with a failed or missing proof.
     Bogus,
 }
 
-/// Result of asking "is this name inside a signed zone?"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoneSignedness {
     Signed,
@@ -46,7 +39,6 @@ enum ZoneSignedness {
     Unknown,
 }
 
-/// Global cryptographic verification work budget for a single resolution.
 #[derive(Debug, Clone)]
 pub struct ValidationBudget {
     sig_checks: usize,
@@ -104,9 +96,23 @@ enum ChainResult {
     Bogus,
 }
 
+#[derive(Debug, Clone)]
+enum RedirectionStep {
+    Cname {
+        owner: Name,
+        target: Name,
+    },
+    Dname {
+        dname_owner: Name,
+        target: Name,
+        input_name: Name,
+        redirected_name: Name,
+    },
+}
+
 #[derive(Debug)]
-enum CnameChainResult {
-    Complete(Vec<(Name, Name)>),
+enum RedirectionChainResult {
+    Complete(Vec<RedirectionStep>),
     Loop,
     TooLong,
 }
@@ -146,7 +152,7 @@ impl DnssecValidator {
         }
     }
 
-    /// Validate the answer section of a positive response.
+    /// Validate the answer section of a positive response, including CNAME and DNAME hops.
     pub async fn validate_answer(
         recursor: &RecursiveResolver,
         name: &Name,
@@ -157,49 +163,107 @@ impl DnssecValidator {
         let chain = if rtype == RecordType::CNAME {
             Vec::new()
         } else {
-            match collect_cname_chain(name, all_records) {
-                CnameChainResult::Complete(c) => c,
-                CnameChainResult::Loop => {
-                    tracing::warn!(name = %name, "[DNSSEC] CNAME loop detected; Bogus");
+            match collect_redirection_chain(name, all_records) {
+                RedirectionChainResult::Complete(c) => c,
+                RedirectionChainResult::Loop => {
+                    tracing::warn!(name = %name, "[DNSSEC] Redirection cycle detected; Bogus");
                     return DnssecStatus::Bogus;
                 }
-                CnameChainResult::TooLong => {
-                    tracing::warn!(name = %name, "[DNSSEC] CNAME chain exceeded limit; Bogus");
+                RedirectionChainResult::TooLong => {
+                    tracing::warn!(name = %name, "[DNSSEC] Redirection chain exceeded limit; Bogus");
                     return DnssecStatus::Bogus;
                 }
             }
         };
 
-        for (owner, _target) in &chain {
-            let cname_records: Vec<Record> = all_records
-                .iter()
-                .filter(|r| r.name() == owner && r.record_type() == RecordType::CNAME)
-                .cloned()
-                .collect();
+        for step in &chain {
+            match step {
+                RedirectionStep::Cname { owner, .. } => {
+                    let cname_records: Vec<Record> = all_records
+                        .iter()
+                        .filter(|r| r.name() == owner && r.record_type() == RecordType::CNAME)
+                        .cloned()
+                        .collect();
 
-            if cname_records.is_empty() {
-                return DnssecStatus::Bogus;
-            }
+                    if cname_records.is_empty() {
+                        return DnssecStatus::Bogus;
+                    }
 
-            match Self::validate_rrset(
-                recursor,
-                owner,
-                RecordType::CNAME,
-                &cname_records,
-                all_records,
-                budget,
-            )
-            .await
-            {
-                DnssecStatus::Secure => {}
-                other => return other,
+                    match Self::validate_rrset(
+                        recursor,
+                        owner,
+                        RecordType::CNAME,
+                        &cname_records,
+                        all_records,
+                        budget,
+                    )
+                    .await
+                    {
+                        DnssecStatus::Secure => {}
+                        other => return other,
+                    }
+                }
+                RedirectionStep::Dname {
+                    dname_owner,
+                    input_name,
+                    ..
+                } => {
+                    // RFC 6672 §3.3: DNAME RRset validation
+                    let dname_records: Vec<Record> = all_records
+                        .iter()
+                        .filter(|r| r.name() == dname_owner && r.record_type() == RecordType::DNAME)
+                        .cloned()
+                        .collect();
+
+                    if dname_records.is_empty() {
+                        return DnssecStatus::Bogus;
+                    }
+
+                    match Self::validate_rrset(
+                        recursor,
+                        dname_owner,
+                        RecordType::DNAME,
+                        &dname_records,
+                        all_records,
+                        budget,
+                    )
+                    .await
+                    {
+                        DnssecStatus::Secure => {}
+                        other => return other,
+                    }
+
+                    // Validate synthesized CNAME if present
+                    let synth_cname_records: Vec<Record> = all_records
+                        .iter()
+                        .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
+                        .cloned()
+                        .collect();
+
+                    if !synth_cname_records.is_empty() {
+                        match Self::validate_rrset(
+                            recursor,
+                            input_name,
+                            RecordType::CNAME,
+                            &synth_cname_records,
+                            all_records,
+                            budget,
+                        )
+                        .await
+                        {
+                            DnssecStatus::Secure => {}
+                            other => return other,
+                        }
+                    }
+                }
             }
         }
 
-        let final_owner = chain
-            .last()
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| name.clone());
+        let final_owner = match chain.last() {
+            Some(RedirectionStep::Cname { target, .. }) => target.clone(),
+            Some(RedirectionStep::Dname { redirected_name, .. }) => redirected_name.clone(),
+            None => name.clone(),
+        };
 
         let target_records: Vec<Record> = all_records
             .iter()
@@ -212,7 +276,7 @@ impl DnssecValidator {
                 name = %name,
                 final_owner = %final_owner,
                 qtype = ?rtype,
-                cname_hops = chain.len(),
+                redirection_hops = chain.len(),
                 "[DNSSEC] No records of requested type at final owner; treating as Unknown"
             );
             return DnssecStatus::InsecureUnknown;
@@ -273,7 +337,6 @@ impl DnssecValidator {
 
         let now = now_secs();
 
-        // Filter for time-valid and authorized signatures
         let mut candidates = Vec::new();
         for rrsig in &rrsigs {
             if !rrsig_time_valid(rrsig, now) {
@@ -390,7 +453,6 @@ impl DnssecValidator {
             }
         };
 
-        // Zone boundary check
         if !zone.zone_of(qname) && zone != *qname {
             tracing::warn!(
                 zone = %zone,
@@ -490,6 +552,7 @@ impl DnssecValidator {
         false
     }
 
+    /// Decomposed RFC 4035 §5.4 NSEC validation
     fn validate_nsec(
         keys: &[DNSKEY],
         qname: &Name,
@@ -516,47 +579,31 @@ impl DnssecValidator {
             }
         }
 
-        // NODATA check: matching QNAME
-        for &rec in &nsec_records {
-            if rec.name() == qname {
-                if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
-                    let has_type = nsec.type_bit_maps().any(|t| t == qtype);
-                    let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
-                    if !has_type && !has_cname {
-                        return DnssecStatus::Secure;
-                    }
-                }
-            }
+        // Proof Type 1: Name Exists — NODATA
+        if let Some(status) = check_nsec_nodata(qname, qtype, &nsec_records) {
+            return status;
         }
 
-        // NXDOMAIN check: QNAME coverage & closest encloser wildcard coverage
-        let qname_covered = nsec_records.iter().any(|&rec| {
-            if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
-                nsec_covers(rec.name(), nsec.next_domain_name(), qname)
-            } else {
-                false
-            }
-        });
-        if !qname_covered {
-            return DnssecStatus::Bogus;
+        // Find Closest Encloser
+        let closest = match find_nsec_closest_encloser(qname, &nsec_records) {
+            Some(c) => c,
+            None => return DnssecStatus::Bogus,
+        };
+
+        // Proof Type 2: Wildcard NODATA
+        if let Some(status) = check_nsec_wildcard_nodata(qname, qtype, &closest, &nsec_records) {
+            return status;
         }
 
-        let closest = closest_encloser(qname, &nsec_records);
-        let wildcard = wildcard_name(&closest);
-        let wildcard_covered = nsec_records.iter().any(|&rec| {
-            if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
-                nsec_covers(rec.name(), nsec.next_domain_name(), &wildcard)
-            } else {
-                false
-            }
-        });
-        if !wildcard_covered {
-            return DnssecStatus::Bogus;
+        // Proof Type 3: Direct NXDOMAIN
+        if let Some(status) = check_nsec_nxdomain(qname, &closest, &nsec_records) {
+            return status;
         }
 
-        DnssecStatus::Secure
+        DnssecStatus::Bogus
     }
 
+    /// Decomposed RFC 5155 §8 NSEC3 validation
     fn validate_nsec3(
         keys: &[DNSKEY],
         qname: &Name,
@@ -593,7 +640,7 @@ impl DnssecValidator {
             return DnssecStatus::InsecureUnknown;
         }
 
-        // Require consistent parameters across all NSEC3 records
+        // Require consistent parameters across all participating NSEC3 records
         for &rec in &nsec3_records {
             match rec.data() {
                 RData::DNSSEC(DNSSECRData::NSEC3(n)) => {
@@ -619,44 +666,13 @@ impl DnssecValidator {
             }
         }
 
-        let hashed_qname = nsec3_hash(qname, &salt, iterations);
-
-        // NODATA proof
-        for &rec in &nsec3_records {
-            if nsec3_owner_hash(rec).as_deref() == Some(hashed_qname.as_slice()) {
-                if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = rec.data() {
-                    let has_type = n.type_bit_maps().any(|t| t == qtype);
-                    let has_cname = n.type_bit_maps().any(|t| t == RecordType::CNAME);
-                    if !has_type && !has_cname {
-                        return DnssecStatus::Secure;
-                    }
-                }
-            }
+        // Proof Type 1: Name Exists — NODATA
+        if let Some(status) = check_nsec3_nodata(qname, qtype, &nsec3_records, &salt, iterations) {
+            return status;
         }
 
-        // Closest encloser proof
-        let mut closest: Option<Name> = None;
-        let mut cur = qname.clone();
-        let mut steps = 0usize;
-        loop {
-            steps += 1;
-            if steps > MAX_CLOSEST_ENCLOSER_STEPS {
-                return DnssecStatus::Bogus;
-            }
-            let h = nsec3_hash(&cur, &salt, iterations);
-            if nsec3_records
-                .iter()
-                .any(|&r| nsec3_owner_hash(r).as_deref() == Some(h.as_slice()))
-            {
-                closest = Some(cur.clone());
-                break;
-            }
-            if cur.is_root() {
-                break;
-            }
-            cur = cur.base_name();
-        }
-        let closest = match closest {
+        // Find Closest Provable Encloser
+        let closest = match find_nsec3_closest_provable_encloser(qname, &nsec3_records, &salt, iterations) {
             Some(c) => c,
             None => return DnssecStatus::Bogus,
         };
@@ -664,49 +680,18 @@ impl DnssecValidator {
         if closest == *qname {
             return DnssecStatus::Bogus;
         }
-        let mut next_closer = qname.clone();
-        while next_closer.base_name() != closest {
-            let parent = next_closer.base_name();
-            if parent == next_closer {
-                return DnssecStatus::Bogus;
-            }
-            next_closer = parent;
-        }
-        let hashed_next = nsec3_hash(&next_closer, &salt, iterations);
 
-        let covering_next = nsec3_records
-            .iter()
-            .find(|&&r| nsec3_covers(r, &hashed_next));
-
-        let covering_rec = match covering_next {
-            Some(r) => *r,
-            None => return DnssecStatus::Bogus,
-        };
-
-        let is_opt_out = match covering_rec.data() {
-            RData::DNSSEC(DNSSECRData::NSEC3(n)) => (n.flags() & 0x01) != 0,
-            _ => false,
-        };
-
-        if is_opt_out {
-            tracing::debug!(
-                qname = %qname,
-                qtype = ?rtype,
-                "[DNSSEC] Opt-Out NSEC3 covers next-closer; proves insecure delegation"
-            );
-            return DnssecStatus::InsecureUnsigned;
+        // Proof Type 2: Wildcard NODATA
+        if let Some(status) = check_nsec3_wildcard_nodata(&closest, qtype, &nsec3_records, &salt, iterations) {
+            return status;
         }
 
-        let wildcard = wildcard_name(&closest);
-        let hashed_wildcard = nsec3_hash(&wildcard, &salt, iterations);
-        if !nsec3_records
-            .iter()
-            .any(|&r| nsec3_covers(r, &hashed_wildcard))
-        {
-            return DnssecStatus::Bogus;
+        // Proof Type 3: Direct NXDOMAIN (including Opt-Out evaluation)
+        if let Some(status) = check_nsec3_nxdomain(qname, &closest, qtype, &nsec3_records, &salt, iterations) {
+            return status;
         }
 
-        DnssecStatus::Secure
+        DnssecStatus::Bogus
     }
 
     async fn build_trust_chain(
@@ -1041,6 +1026,257 @@ impl DnssecValidator {
 }
 
 // -------------------------------------------------------------------------
+// Decomposed NSEC Proof Types (RFC 4035 §5.4)
+// -------------------------------------------------------------------------
+
+fn find_nsec_closest_encloser(qname: &Name, nsec_records: &[&Record]) -> Option<Name> {
+    let mut cur = if qname.is_root() {
+        qname.clone()
+    } else {
+        qname.base_name()
+    };
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > MAX_CLOSEST_ENCLOSER_STEPS {
+            return None;
+        }
+        if nsec_records.iter().any(|r| r.name() == &cur) {
+            return Some(cur);
+        }
+        if cur.is_root() {
+            break;
+        }
+        cur = cur.base_name();
+    }
+    None
+}
+
+fn check_nsec_nodata(
+    qname: &Name,
+    qtype: RecordType,
+    nsec_records: &[&Record],
+) -> Option<DnssecStatus> {
+    for &rec in nsec_records {
+        if rec.name() == qname {
+            if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
+                let has_type = nsec.type_bit_maps().any(|t| t == qtype);
+                let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
+                let has_soa = nsec.type_bit_maps().any(|t| t == RecordType::SOA);
+
+                if qtype == RecordType::DS && has_soa {
+                    return Some(DnssecStatus::Bogus);
+                }
+
+                if !has_type && !has_cname {
+                    return Some(DnssecStatus::Secure);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_nsec_wildcard_nodata(
+    qname: &Name,
+    qtype: RecordType,
+    closest: &Name,
+    nsec_records: &[&Record],
+) -> Option<DnssecStatus> {
+    let wildcard = wildcard_name(closest);
+    let wildcard_nsec = nsec_records.iter().find(|&&r| r.name() == &wildcard)?;
+    if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = wildcard_nsec.data() {
+        let has_type = nsec.type_bit_maps().any(|t| t == qtype);
+        let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
+        if has_type || has_cname {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    let qname_covered = nsec_records.iter().any(|&rec| {
+        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
+            nsec_covers(rec.name(), nsec.next_domain_name(), qname)
+        } else {
+            false
+        }
+    });
+
+    if qname_covered {
+        Some(DnssecStatus::Secure)
+    } else {
+        None
+    }
+}
+
+fn check_nsec_nxdomain(
+    qname: &Name,
+    closest: &Name,
+    nsec_records: &[&Record],
+) -> Option<DnssecStatus> {
+    let qname_covered = nsec_records.iter().any(|&rec| {
+        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
+            nsec_covers(rec.name(), nsec.next_domain_name(), qname)
+        } else {
+            false
+        }
+    });
+    if !qname_covered {
+        return None;
+    }
+
+    let wildcard = wildcard_name(closest);
+    let wildcard_covered = nsec_records.iter().any(|&rec| {
+        if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
+            nsec_covers(rec.name(), nsec.next_domain_name(), &wildcard)
+        } else {
+            false
+        }
+    });
+    if !wildcard_covered {
+        return None;
+    }
+
+    Some(DnssecStatus::Secure)
+}
+
+// -------------------------------------------------------------------------
+// Decomposed NSEC3 Proof Types (RFC 5155 §8)
+// -------------------------------------------------------------------------
+
+fn find_nsec3_closest_provable_encloser(
+    qname: &Name,
+    nsec3_records: &[&Record],
+    salt: &[u8],
+    iterations: u16,
+) -> Option<Name> {
+    let mut cur = qname.clone();
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > MAX_CLOSEST_ENCLOSER_STEPS {
+            return None;
+        }
+        let h = nsec3_hash(&cur, salt, iterations);
+        if nsec3_records
+            .iter()
+            .any(|&r| nsec3_owner_hash(r).as_deref() == Some(h.as_slice()))
+        {
+            return Some(cur);
+        }
+        if cur.is_root() {
+            break;
+        }
+        cur = cur.base_name();
+    }
+    None
+}
+
+fn check_nsec3_nodata(
+    qname: &Name,
+    qtype: RecordType,
+    nsec3_records: &[&Record],
+    salt: &[u8],
+    iterations: u16,
+) -> Option<DnssecStatus> {
+    let hashed_qname = nsec3_hash(qname, salt, iterations);
+    for &rec in nsec3_records {
+        if nsec3_owner_hash(rec).as_deref() == Some(hashed_qname.as_slice()) {
+            if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = rec.data() {
+                let has_type = n.type_bit_maps().any(|t| t == qtype);
+                let has_cname = n.type_bit_maps().any(|t| t == RecordType::CNAME);
+                let has_soa = n.type_bit_maps().any(|t| t == RecordType::SOA);
+
+                if qtype == RecordType::DS && has_soa {
+                    return Some(DnssecStatus::Bogus);
+                }
+
+                if !has_type && !has_cname {
+                    return Some(DnssecStatus::Secure);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_nsec3_wildcard_nodata(
+    closest: &Name,
+    qtype: RecordType,
+    nsec3_records: &[&Record],
+    salt: &[u8],
+    iterations: u16,
+) -> Option<DnssecStatus> {
+    let wildcard = wildcard_name(closest);
+    let hashed_wildcard = nsec3_hash(&wildcard, salt, iterations);
+
+    let wildcard_rec = nsec3_records
+        .iter()
+        .find(|&&r| nsec3_owner_hash(r).as_deref() == Some(hashed_wildcard.as_slice()))?;
+
+    if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = wildcard_rec.data() {
+        let has_type = n.type_bit_maps().any(|t| t == qtype);
+        let has_cname = n.type_bit_maps().any(|t| t == RecordType::CNAME);
+        if has_type || has_cname {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    Some(DnssecStatus::Secure)
+}
+
+fn check_nsec3_nxdomain(
+    qname: &Name,
+    closest: &Name,
+    qtype: RecordType,
+    nsec3_records: &[&Record],
+    salt: &[u8],
+    iterations: u16,
+) -> Option<DnssecStatus> {
+    let mut next_closer = qname.clone();
+    while next_closer.base_name() != *closest {
+        let parent = next_closer.base_name();
+        if parent == next_closer {
+            return Some(DnssecStatus::Bogus);
+        }
+        next_closer = parent;
+    }
+    let hashed_next = nsec3_hash(&next_closer, salt, iterations);
+
+    let covering_rec = nsec3_records
+        .iter()
+        .find(|&&r| nsec3_covers(r, &hashed_next))?;
+
+    let is_opt_out = match covering_rec.data() {
+        RData::DNSSEC(DNSSECRData::NSEC3(n)) => (n.flags() & 0x01) != 0,
+        _ => false,
+    };
+
+    if is_opt_out {
+        tracing::debug!(
+            qname = %qname,
+            qtype = ?qtype,
+            "[DNSSEC] Opt-Out NSEC3 covers next-closer; proves insecure delegation"
+        );
+        return Some(DnssecStatus::InsecureUnsigned);
+    }
+
+    let wildcard = wildcard_name(closest);
+    let hashed_wildcard = nsec3_hash(&wildcard, salt, iterations);
+    if !nsec3_records
+        .iter()
+        .any(|&r| nsec3_covers(r, &hashed_wildcard))
+    {
+        return Some(DnssecStatus::Bogus);
+    }
+
+    Some(DnssecStatus::Secure)
+}
+
+// -------------------------------------------------------------------------
 // Helper functions
 // -------------------------------------------------------------------------
 
@@ -1050,20 +1286,21 @@ fn rrsig_time_valid(sig: &RRSIG, now: u64) -> bool {
     now >= inc && now <= exp
 }
 
-fn collect_cname_chain(name: &Name, records: &[Record]) -> CnameChainResult {
+fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChainResult {
     let mut chain = Vec::new();
     let mut current = name.clone();
     let mut seen: HashSet<Name> = HashSet::new();
 
     loop {
         if !seen.insert(current.clone()) {
-            return CnameChainResult::Loop;
+            return RedirectionChainResult::Loop;
         }
         if chain.len() >= MAX_CNAME_CHAIN {
-            return CnameChainResult::TooLong;
+            return RedirectionChainResult::TooLong;
         }
 
-        let target = records.iter().find_map(|r| {
+        // 1. Direct CNAME check
+        let cname_target = records.iter().find_map(|r| {
             if r.name() == &current && r.record_type() == RecordType::CNAME {
                 if let RData::CNAME(c) = r.data() {
                     return Some(c.0.clone());
@@ -1072,16 +1309,44 @@ fn collect_cname_chain(name: &Name, records: &[Record]) -> CnameChainResult {
             None
         });
 
-        match target {
-            Some(t) => {
-                chain.push((current.clone(), t.clone()));
-                current = t;
-            }
-            None => break,
+        if let Some(target) = cname_target {
+            chain.push(RedirectionStep::Cname {
+                owner: current.clone(),
+                target: target.clone(),
+            });
+            current = target;
+            continue;
         }
+
+        // 2. Matching DNAME check
+        let dname_step = records.iter().find_map(|r| {
+            if r.record_type() == RecordType::DNAME
+                && r.name().zone_of(&current)
+                && r.name() != &current
+            {
+                if let RData::DNAME(d) = r.data() {
+                    let sub = dname_substitute(&current, r.name(), &d.0)?;
+                    return Some((r.name().clone(), d.0.clone(), sub));
+                }
+            }
+            None
+        });
+
+        if let Some((dname_owner, target, redirected_name)) = dname_step {
+            chain.push(RedirectionStep::Dname {
+                dname_owner,
+                target,
+                input_name: current.clone(),
+                redirected_name: redirected_name.clone(),
+            });
+            current = redirected_name;
+            continue;
+        }
+
+        break;
     }
 
-    CnameChainResult::Complete(chain)
+    RedirectionChainResult::Complete(chain)
 }
 
 async fn is_zone_signed(
@@ -1116,7 +1381,6 @@ async fn is_zone_signed(
         cur = cur.base_name();
     }
 
-    // Walk up to find the true zone apex
     let mut apex_candidate = name.clone();
     let mut zone = None;
 
@@ -1166,7 +1430,6 @@ async fn is_zone_signed(
         }
     };
 
-    // Authenticate signedness using trust chain validation
     let signedness = match DnssecValidator::build_trust_chain(recursor, &zone, budget).await {
         ChainResult::Trusted(_) => ZoneSignedness::Signed,
         ChainResult::Unsigned => ZoneSignedness::ProvenUnsigned,
@@ -1194,26 +1457,12 @@ async fn is_zone_signed(
 }
 
 fn wildcard_name(closest: &Name) -> Name {
-    let base = closest.to_ascii();
-    let base = base.trim_end_matches('.');
-    Name::from_str(&format!("*.{}.", base)).unwrap_or_else(|_| Name::root())
-}
-
-fn closest_encloser(qname: &Name, nsec_records: &[&Record]) -> Name {
-    let mut cur = qname.base_name();
-    let mut steps = 0usize;
-    loop {
-        steps += 1;
-        if steps > MAX_CLOSEST_ENCLOSER_STEPS {
-            return Name::root();
-        }
-        if nsec_records.iter().any(|&r| r.name() == &cur) {
-            return cur;
-        }
-        if cur.is_root() {
-            return Name::root();
-        }
-        cur = cur.base_name();
+    if closest.is_root() {
+        Name::from_str("*.").unwrap_or_else(|_| Name::root())
+    } else {
+        let base = closest.to_ascii();
+        let base = base.trim_end_matches('.');
+        Name::from_str(&format!("*.{}.", base)).unwrap_or_else(|_| Name::root())
     }
 }
 
@@ -1523,7 +1772,6 @@ fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     let (exponent, modulus) = rest.split_at(exp_len);
-    // Enforce 2048-8192 bit length bounds
     if modulus.is_empty() || modulus.len() < 256 || modulus.len() > 1024 {
         return None;
     }

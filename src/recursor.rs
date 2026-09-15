@@ -1,13 +1,14 @@
 use dashmap::DashMap;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -41,6 +42,8 @@ const MAX_STEPS: usize = 16;
 const MIN_DELEGATION_TTL: u64 = 300;
 const MAX_DELEGATION_TTL: u64 = 172_800;
 
+pub const DNAME_RECORD_TYPE: RecordType = RecordType::Unknown(39);
+
 #[derive(Debug, Error)]
 pub enum RecursorError {
     #[error("Maximum recursion depth exceeded")]
@@ -68,6 +71,33 @@ struct DelegationEntry {
 
 pub struct RecursiveResolver {
     delegation_cache: DashMap<String, DelegationEntry>,
+}
+
+/// RFC 6672 DNAME suffix substitution: replace `dname_owner` suffix in `name` with `target`.
+pub fn dname_substitute(name: &Name, dname_owner: &Name, target: &Name) -> Option<Name> {
+    if !dname_owner.zone_of(name) || dname_owner == name {
+        return None;
+    }
+    let name_str = name.to_string().to_lowercase();
+    let owner_str = dname_owner.to_string().to_lowercase();
+    if !name_str.ends_with(&owner_str) {
+        return None;
+    }
+    let prefix = &name_str[..name_str.len() - owner_str.len()];
+    let target_str = target.to_string();
+    let new_name_str = format!("{}{}", prefix, target_str);
+    Name::from_str(&new_name_str).ok()
+}
+
+pub fn extract_dname_target(record: &Record) -> Option<Name> {
+    if record.record_type() == DNAME_RECORD_TYPE {
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        record.data().emit(&mut encoder).ok()?;
+        let mut decoder = BinDecoder::new(&buf);
+        return Name::read(&mut decoder).ok();
+    }
+    None
 }
 
 fn is_safe_upstream_ip(ip: IpAddr) -> bool {
@@ -171,7 +201,7 @@ impl RecursiveResolver {
                     None => return Err(RecursorError::AllNameserversFailed),
                 };
 
-                // 1. Positive answer or CNAME for the exact queried name
+                // 1. Exact positive answer, CNAME, or DNAME redirection
                 if !response.answers().is_empty() {
                     let has_target_type = response
                         .answers()
@@ -185,6 +215,15 @@ impl RecursiveResolver {
                             } else {
                                 None
                             }
+                        } else {
+                            None
+                        }
+                    });
+
+                    let dname_redirect = response.answers().iter().find_map(|r| {
+                        if r.record_type() == DNAME_RECORD_TYPE && r.name().zone_of(name) && r.name() != name {
+                            let target = extract_dname_target(r)?;
+                            dname_substitute(name, r.name(), &target)
                         } else {
                             None
                         }
@@ -204,6 +243,23 @@ impl RecursiveResolver {
                         {
                             let mut merged = response.clone();
                             for ans in cname_resp.answers() {
+                                merged.add_answer(ans.clone());
+                            }
+                            return Ok(merged);
+                        }
+                        return Ok(response);
+                    } else if let Some(substituted) = dname_redirect {
+                        let key = format!("dname:{}", substituted.to_string().to_lowercase());
+                        if visited.contains(&key) {
+                            return Ok(response);
+                        }
+                        visited.insert(key);
+
+                        if let Ok(dname_resp) =
+                            self.resolve_internal(&substituted, rtype, depth + 1, visited).await
+                        {
+                            let mut merged = response.clone();
+                            for ans in dname_resp.answers() {
                                 merged.add_answer(ans.clone());
                             }
                             return Ok(merged);
@@ -247,7 +303,6 @@ impl RecursiveResolver {
 
                 let delegation_owner = first_ns_rec.name().clone();
 
-                // Group and ensure coherent NS delegation owner
                 let mut ns_names = Vec::new();
                 for r in response.name_servers() {
                     if r.record_type() == RecordType::NS {
@@ -255,7 +310,7 @@ impl RecursiveResolver {
                             tracing::warn!(
                                 expected = %delegation_owner,
                                 actual = %r.name(),
-                                "[SECURITY] Inconsistent NS owners in referral; aborting"
+                                "[SECURITY] Inconsistent NS owners in referral; rejecting"
                             );
                             return Err(RecursorError::NoProgress);
                         }
@@ -310,7 +365,7 @@ impl RecursiveResolver {
                     );
                 }
 
-                // If glue was omitted, iteratively resolve A and AAAA
+                // Iteratively resolve A and AAAA for nameservers when glue is omitted
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
@@ -496,7 +551,6 @@ impl RecursiveResolver {
             return Err(RecursorError::AllNameserversFailed);
         }
 
-        // Handle truncation over TCP with whole-transaction timeout protection
         if response.truncated() {
             let tcp_response = timeout(TCP_TIMEOUT, async {
                 let mut stream = TcpStream::connect(addr).await?;
