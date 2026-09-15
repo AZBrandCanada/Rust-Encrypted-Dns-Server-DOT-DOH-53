@@ -453,11 +453,30 @@ impl DnssecValidator {
             }
         };
 
-        if !zone.zone_of(qname) && zone != *qname {
+        // Determine the target name being evaluated for negative existence:
+        // If the answer section contains a CNAME chain, the SOA in the authority
+        // section applies to the final CNAME target, not the initial query name.
+        let final_target = msg
+            .answers()
+            .iter()
+            .filter(|r| r.record_type() == RecordType::CNAME)
+            .last()
+            .and_then(|r| {
+                if let RData::CNAME(cname) = r.data() {
+                    Some(cname.0.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| qname.clone());
+
+        // Zone boundary check: SOA must be authoritative for the final target
+        if !zone.zone_of(&final_target) && zone != final_target && !zone.zone_of(qname) && zone != *qname {
             tracing::warn!(
                 zone = %zone,
                 qname = %qname,
-                "[DNSSEC] Negative response SOA is not authoritative for qname; Bogus"
+                final_target = %final_target,
+                "[DNSSEC] Negative response SOA is not authoritative for target; Bogus"
             );
             return DnssecStatus::Bogus;
         }
@@ -488,14 +507,14 @@ impl DnssecValidator {
             .iter()
             .any(|r| r.record_type() == RecordType::NSEC3);
         if has_nsec3 {
-            return Self::validate_nsec3(&keys, qname, qtype, &authority, budget);
+            return Self::validate_nsec3(&keys, &final_target, qtype, &authority, budget);
         }
 
         let has_nsec = authority
             .iter()
             .any(|r| r.record_type() == RecordType::NSEC);
         if has_nsec {
-            return Self::validate_nsec(&keys, qname, qtype, &authority, budget);
+            return Self::validate_nsec(&keys, &final_target, qtype, &authority, budget);
         }
 
         tracing::warn!(

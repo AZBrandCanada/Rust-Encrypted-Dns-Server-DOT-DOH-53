@@ -73,6 +73,35 @@ pub struct RecursiveResolver {
     delegation_cache: DashMap<String, DelegationEntry>,
 }
 
+/// Robust DNS message decoder that handles buggy authoritative servers (e.g. dnsleaktest.com).
+/// If decoding fails and the packet contains records in the Additional section, it retries
+/// with ARCOUNT=0 to salvage the valid Answer and Authority sections.
+fn decode_response(buf: &[u8]) -> Result<Message, hickory_proto::ProtoError> {
+    let mut decoder = BinDecoder::new(buf);
+    match Message::read(&mut decoder) {
+        Ok(msg) => Ok(msg),
+        Err(e) => {
+            if buf.len() >= 12 {
+                let arcount = u16::from_be_bytes([buf[10], buf[11]]);
+                if arcount > 0 {
+                    let mut sanitized = buf.to_vec();
+                    sanitized[10] = 0;
+                    sanitized[11] = 0;
+                    let mut second_decoder = BinDecoder::new(&sanitized);
+                    if let Ok(salvaged) = Message::read(&mut second_decoder) {
+                        tracing::debug!(
+                            arcount,
+                            "[RECURSOR] Salvaged DNS response by ignoring malformed Additional section"
+                        );
+                        return Ok(salvaged);
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// RFC 6672 DNAME suffix substitution with strict length validation.
 pub fn dname_substitute(name: &Name, dname_owner: &Name, target: &Name) -> Result<Name, ResponseCode> {
     if !dname_owner.zone_of(name) || dname_owner == name {
@@ -420,6 +449,7 @@ impl RecursiveResolver {
 
                 let active_delegation = delegation_owner;
 
+                // Extract glue from additionals
                 let mut next_ips: Vec<IpAddr> = Vec::new();
                 for add in response.additionals() {
                     if !ns_names.iter().any(|n| n == add.name()) {
@@ -458,6 +488,7 @@ impl RecursiveResolver {
                     );
                 }
 
+                // If glue was omitted (or out-of-bailiwick), iteratively resolve nameserver IPs
                 if next_ips.is_empty() {
                     for ns_name in &ns_names {
                         let key_ns = format!("ns:resolve:{}", ns_name.to_string().to_lowercase());
@@ -639,15 +670,11 @@ impl RecursiveResolver {
             .await
             .map_err(|_| RecursorError::AllNameserversFailed)??;
 
-        // 2. Decode UDP response with RFC 6891 §7 EDNS fallback
-        let mut decoder = BinDecoder::new(&buf[..n]);
+        // 2. Decode UDP response with malformed Additional recovery & RFC 6891 §7 EDNS fallback
         let mut used_edns = true;
-        let response = match Message::read(&mut decoder) {
+        let response = match decode_response(&buf[..n]) {
             Ok(resp) if resp.response_code() != ResponseCode::FormErr => resp,
             _ => {
-                // EDNS Fallback (RFC 6891 §7): Some broken authoritative servers (e.g. dnsleaktest.com)
-                // return malformed OPT records or FORMERR when queried with EDNS0.
-                // Retry once using plain RFC 1035 DNS (no EDNS).
                 let mut plain_msg = Message::new();
                 plain_msg.set_id(txid);
                 plain_msg.set_message_type(MessageType::Query);
@@ -662,9 +689,8 @@ impl RecursiveResolver {
                     .await
                     .map_err(|_| RecursorError::AllNameserversFailed)??;
 
-                let mut decoder = BinDecoder::new(&buf[..n]);
                 used_edns = false;
-                Message::read(&mut decoder)?
+                decode_response(&buf[..n])?
             }
         };
 
@@ -676,7 +702,6 @@ impl RecursiveResolver {
             let tcp_response = timeout(TCP_TIMEOUT, async {
                 let mut stream = TcpStream::connect(addr).await?;
 
-                // If EDNS failed over UDP, use plain query over TCP as well
                 let tcp_query_bytes = if used_edns {
                     req_bytes
                 } else {
@@ -703,8 +728,7 @@ impl RecursiveResolver {
                 let mut tcp_buf = vec![0u8; resp_len];
                 stream.read_exact(&mut tcp_buf).await?;
 
-                let mut tcp_decoder = BinDecoder::new(&tcp_buf);
-                let tcp_msg = match Message::read(&mut tcp_decoder) {
+                let tcp_msg = match decode_response(&tcp_buf) {
                     Ok(m) => m,
                     Err(_) => {
                         let mut plain_msg = Message::new();
@@ -727,8 +751,7 @@ impl RecursiveResolver {
                         }
                         let mut tcp_buf = vec![0u8; resp_len];
                         stream.read_exact(&mut tcp_buf).await?;
-                        let mut tcp_decoder = BinDecoder::new(&tcp_buf);
-                        Message::read(&mut tcp_decoder)?
+                        decode_response(&tcp_buf)?
                     }
                 };
                 Ok(tcp_msg)
